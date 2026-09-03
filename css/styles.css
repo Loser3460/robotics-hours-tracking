@@ -1,0 +1,125 @@
+/* =========================================================================
+   Robotics Lab Attendance Tracker — shared styles.
+
+   Sized for a wall-mounted tablet read at arm's length: type scales with the
+   viewport, targets are finger-sized, and nothing relies on hover.
+   ========================================================================= */
+
+:root {
+  /* Palette — dark by default. A lab is dim and a bright screen at night is
+     unpleasant; the status colours stay legible across the room either way. */
+  --bg:            #0d1117;
+  --bg-raised:     #161b22;
+  --border:        #30363d;
+  --text:          #f0f6fc;
+  --text-dim:      #9198a1;
+
+  --in:            #1a7f37;   /* green — welcome */
+  --in-bright:     #3fb950;
+  --out:          #0d5bbf;    /* blue — goodbye */
+  --out-bright:    #58a6ff;
+  --warn:          #9e6a03;   /* amber — queued offline */
+  --warn-bright:   #d29922;
+  --error:         #a4232f;   /* red — something is wrong */
+  --error-bright:  #f85149;
+
+  /* Type scale: vmin-based so it fills the screen on any tablet, clamped so it
+     stays sane on a phone or a desktop browser during development. */
+  --step-hero:  clamp(3rem, 13vmin, 9rem);
+  --step-xl:    clamp(2rem, 8vmin, 5rem);
+  --step-lg:    clamp(1.5rem, 5vmin, 3rem);
+  --step-md:    clamp(1.125rem, 3.2vmin, 2rem);
+  --step-sm:    clamp(1rem, 2.4vmin, 1.5rem);
+
+  --tap: 4.5rem;              /* minimum tap target — nothing smaller, anywhere */
+  --radius: 0.75rem;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-text-size-adjust: 100%;
+}
+
+/* The tablet pages are fixed full-screen surfaces. Nothing scrolls, nothing
+   rubber-bands, and a stray swipe cannot drag the page off-centre. */
+body.fixed-surface {
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Buttons ---------------------------------------------------------------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5em;
+  min-height: var(--tap);
+  padding: 0 1.5em;
+  border: 2px solid transparent;
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--step-md);
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.btn:active { transform: scale(0.98); }
+.btn:focus-visible { outline: 4px solid var(--out-bright); outline-offset: 3px; }
+.btn[disabled] { opacity: 0.5; cursor: default; }
+
+.btn--primary { background: var(--in); border-color: var(--in-bright); }
+.btn--ghost   { background: transparent; border-color: var(--border); color: var(--text-dim); }
+.btn--big     { min-height: calc(var(--tap) * 1.3); font-size: var(--step-lg); }
+.btn--block   { width: 100%; }
+
+/* Fields ----------------------------------------------------------------- */
+
+.field {
+  width: 100%;
+  min-height: calc(var(--tap) * 1.2);
+  padding: 0 0.75em;
+  border: 3px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--step-lg);
+}
+
+.field:focus { outline: none; border-color: var(--out-bright); }
+.field::placeholder { color: var(--text-dim); }
+
+/* Utility ---------------------------------------------------------------- */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

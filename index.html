@@ -1,0 +1,774 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Kiosk viewport: the tablet is bolted to a wall, so pinch-zoom and
+     rubber-band scrolling only ever break the layout by accident. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0d1117">
+<title>Lab Scanner</title>
+<link rel="stylesheet" href="css/styles.css">
+<style>
+  /* ---- camera stage ---- */
+  #stage { position: fixed; inset: 0; background: #000; }
+  #video {
+    width: 100%; height: 100%;
+    object-fit: cover;
+    /* The rear camera is not mirrored; do not transform it or the QR reads fine
+       but the picture confuses anyone lining up their card. */
+  }
+  #frame { display: none; }
+
+  /* ---- aiming reticle ---- */
+  .reticle {
+    position: fixed; top: 50%; left: 50%;
+    width: min(52vmin, 30rem); height: min(52vmin, 30rem);
+    transform: translate(-50%, -54%);
+    border-radius: 2rem;
+    box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+  }
+  .reticle::before, .reticle::after,
+  .reticle span::before, .reticle span::after {
+    content: ""; position: absolute;
+    width: 4rem; height: 4rem;
+    border: 0.5rem solid var(--text);
+    opacity: 0.9;
+  }
+  .reticle::before  { top: 0; left: 0;  border-right: 0; border-bottom: 0; border-radius: 2rem 0 0 0; }
+  .reticle::after   { top: 0; right: 0; border-left: 0;  border-bottom: 0; border-radius: 0 2rem 0 0; }
+  .reticle span::before { bottom: 0; left: 0;  border-right: 0; border-top: 0; border-radius: 0 0 0 2rem; }
+  .reticle span::after  { bottom: 0; right: 0; border-left: 0;  border-top: 0; border-radius: 0 0 2rem 0; }
+
+  .prompt {
+    position: fixed; left: 0; right: 0;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 6vmin);
+    margin: 0; text-align: center;
+    font-size: var(--step-lg); font-weight: 700;
+    text-shadow: 0 2px 12px rgba(0, 0, 0, 0.9);
+  }
+
+  /* ---- status bar ---- */
+  .statusbar {
+    position: fixed; left: 0; right: 0;
+    top: env(safe-area-inset-top, 0px);
+    display: flex; align-items: center; gap: 1rem;
+    padding: 1.25rem 1.75rem;
+    font-size: var(--step-sm); font-weight: 600;
+    text-shadow: 0 2px 12px rgba(0, 0, 0, 0.9);
+  }
+  .statusbar__spacer { flex: 1; }
+  #clock { font-variant-numeric: tabular-nums; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 0.5em;
+    padding: 0.4em 0.9em; border-radius: 999px;
+    background: var(--warn); color: #fff;
+  }
+  .badge--offline { background: var(--error); }
+  .dot { width: 0.8em; height: 0.8em; border-radius: 50%; background: currentColor; }
+
+  /* ---- full-screen result overlay ---- */
+  .overlay {
+    position: fixed; inset: 0; z-index: 10;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 2vmin; padding: 6vmin;
+    text-align: center;
+    background: var(--bg-raised);
+    animation: overlay-in 160ms ease-out;
+  }
+  @keyframes overlay-in { from { opacity: 0; } to { opacity: 1; } }
+  .overlay[data-tone="in"]      { background: var(--in); }
+  .overlay[data-tone="out"]     { background: var(--out); }
+  .overlay[data-tone="warn"]    { background: var(--warn); }
+  .overlay[data-tone="error"]   { background: var(--error); }
+  .overlay[data-tone="neutral"] { background: var(--bg-raised); }
+
+  .overlay__kicker { font-size: var(--step-lg); font-weight: 700; opacity: 0.85; margin: 0; }
+  .overlay__name {
+    margin: 0; font-size: var(--step-hero); font-weight: 800; line-height: 1.05;
+    overflow-wrap: anywhere;
+  }
+  .overlay__detail { margin: 0; font-size: var(--step-xl); font-weight: 700; }
+  .overlay__note {
+    margin: 2vmin 0 0; font-size: var(--step-md); font-weight: 600;
+    padding: 0.5em 1em; border-radius: 999px;
+    background: rgba(0, 0, 0, 0.3);
+  }
+  /* Progress bar showing how long the confirmation stays up. */
+  .overlay__timer {
+    position: absolute; left: 0; bottom: 0; height: 0.75rem;
+    background: rgba(255, 255, 255, 0.7);
+    animation: drain var(--hold, 4000ms) linear forwards;
+  }
+  @keyframes drain { from { width: 100%; } to { width: 0%; } }
+
+  /* ---- sheets (enrollment, PIN, fatal error) ---- */
+  .sheet {
+    position: fixed; inset: 0; z-index: 20;
+    display: flex; flex-direction: column; justify-content: center;
+    gap: 3vmin; padding: 6vmin;
+    background: var(--bg);
+  }
+  .sheet h1 { margin: 0; font-size: var(--step-lg); font-weight: 700; color: var(--text-dim); }
+  .sheet__id {
+    margin: 0; font-size: var(--step-hero); font-weight: 800;
+    font-variant-numeric: tabular-nums; letter-spacing: 0.06em;
+  }
+  .sheet__row { display: flex; gap: 2vmin; }
+  .sheet__row > * { flex: 1; }
+  .sheet__msg { margin: 0; font-size: var(--step-md); color: var(--text-dim); min-height: 1.4em; }
+  .sheet__msg[data-tone="error"] { color: var(--error-bright); }
+
+  [hidden] { display: none !important; }
+</style>
+</head>
+
+<body class="fixed-surface">
+
+  <!-- Camera -->
+  <div id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="frame"></canvas>
+  </div>
+  <div class="reticle" aria-hidden="true"><span></span></div>
+  <p class="prompt" id="prompt">Scan your card</p>
+
+  <!-- Status bar. Long-press it to prime the roster cache (see script). -->
+  <header class="statusbar" id="statusbar">
+    <span id="clock">--:--</span>
+    <span class="statusbar__spacer"></span>
+    <span class="badge" id="queue-badge" hidden></span>
+    <span class="badge badge--offline" id="offline-badge" hidden><span class="dot"></span> Offline</span>
+  </header>
+
+  <!-- Full-screen confirmation -->
+  <div class="overlay" id="overlay" role="status" aria-live="assertive" hidden>
+    <p class="overlay__kicker" id="ov-kicker"></p>
+    <p class="overlay__name"   id="ov-name"></p>
+    <p class="overlay__detail" id="ov-detail"></p>
+    <p class="overlay__note"   id="ov-note" hidden></p>
+    <div class="overlay__timer" id="ov-timer"></div>
+  </div>
+
+  <!-- Enrollment for an unrecognised card -->
+  <div class="sheet" id="enroll-sheet" hidden>
+    <h1>This card isn't on the roster yet</h1>
+    <p class="sheet__id" id="enroll-id">-------</p>
+    <label class="visually-hidden" for="enroll-name">Full name</label>
+    <input class="field" id="enroll-name" type="text" placeholder="Type your full name"
+           autocomplete="off" autocapitalize="words" spellcheck="false" enterkeyhint="done">
+    <p class="sheet__msg" id="enroll-msg"></p>
+    <div class="sheet__row">
+      <button class="btn btn--ghost btn--big" id="enroll-cancel" type="button">Cancel</button>
+      <button class="btn btn--primary btn--big" id="enroll-save" type="button">Save &amp; check in</button>
+    </div>
+  </div>
+
+  <!-- Optional: prime the local name cache from the roster (coaches only) -->
+  <div class="sheet" id="pin-sheet" hidden>
+    <h1>Load roster onto this tablet</h1>
+    <label class="visually-hidden" for="pin-input">Admin PIN</label>
+    <input class="field" id="pin-input" type="password" inputmode="numeric" placeholder="Admin PIN"
+           autocomplete="off" enterkeyhint="done">
+    <p class="sheet__msg" id="pin-msg">Caches names on this tablet so they show instantly, even offline. The PIN is not saved.</p>
+    <div class="sheet__row">
+      <button class="btn btn--ghost btn--big" id="pin-cancel" type="button">Cancel</button>
+      <button class="btn btn--primary btn--big" id="pin-save" type="button">Load</button>
+    </div>
+  </div>
+
+  <!-- Camera or config failure -->
+  <div class="sheet" id="fatal-sheet" hidden>
+    <h1 id="fatal-title">Scanner unavailable</h1>
+    <p class="sheet__msg" id="fatal-msg" data-tone="error"></p>
+    <button class="btn btn--primary btn--big" id="fatal-retry" type="button">Try again</button>
+  </div>
+
+<script type="module">
+import * as api from './js/api.js';
+import { ApiError, isValidStudentId } from './js/api.js';
+
+// ---------------------------------------------------------------------------
+// Tunables
+// ---------------------------------------------------------------------------
+
+const DECODE_INTERVAL_MS = 120;    // how often we look for a QR code
+const REPEAT_LOCKOUT_MS  = 6000;   // ignore the same card re-entering the frame
+const HOLD_MS            = 4000;   // how long a confirmation stays up
+const BRIEF_MS           = 1800;   // for minor notices
+const SYNC_INTERVAL_MS   = 60000;  // background retry of the offline queue
+
+const KEY_QUEUE    = 'lab.queue';
+const KEY_STUDENTS = 'lab.students';
+
+const JSQR_URL = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
+const JSQR_SRI = 'sha384-b5Ya4Bq3qCyz39m2ISh+4DxjAIljdeFwK/BsXLuj9gugaNwAcj/ia15fxNZL9Nlx';
+
+// ---------------------------------------------------------------------------
+// Elements
+// ---------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+const video = $('video');
+const canvas = $('frame');
+const overlay = $('overlay');
+
+// ---------------------------------------------------------------------------
+// Local storage: the student name cache and the offline queue
+//
+// The tablet has no admin PIN, so it cannot pull the roster on its own — see
+// primeRoster() at the bottom. Instead the cache fills itself in: every scan
+// and enrollment teaches it one more name, along with that student's last known
+// direction and check-in time so an offline scan can still say
+// "Goodbye, Sam — 2h 14m" without the server.
+// ---------------------------------------------------------------------------
+
+function readStore(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;      // corrupted or storage disabled: carry on, don't crash
+  }
+}
+
+function writeStore(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (err) {
+    console.warn('could not write ' + key, err);
+  }
+}
+
+const students = {
+  all: readStore(KEY_STUDENTS, {}),
+  get(id) { return this.all[id] || null; },
+  remember(id, patch) {
+    this.all[id] = Object.assign({}, this.all[id], patch);
+    writeStore(KEY_STUDENTS, this.all);
+  },
+  get size() { return Object.keys(this.all).length; },
+};
+
+const queue = {
+  items: readStore(KEY_QUEUE, []),
+  save() { writeStore(KEY_QUEUE, this.items); renderStatus(); },
+  push(item) { this.items.push(item); this.save(); },
+  get length() { return this.items.length; },
+};
+
+// ---------------------------------------------------------------------------
+// Status bar
+// ---------------------------------------------------------------------------
+
+function renderStatus() {
+  const badge = $('queue-badge');
+  if (queue.length) {
+    badge.textContent = queue.length === 1
+      ? '1 scan waiting to sync'
+      : queue.length + ' scans waiting to sync';
+    badge.hidden = false;
+  } else {
+    badge.hidden = true;
+  }
+  $('offline-badge').hidden = navigator.onLine !== false;
+}
+
+function tickClock() {
+  $('clock').textContent = new Date()
+    .toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+// ---------------------------------------------------------------------------
+// Screens
+// ---------------------------------------------------------------------------
+
+let holdTimer = null;
+let paused = true;              // true whenever something covers the camera
+
+function showOverlay({ tone, kicker, name, detail, note, hold = HOLD_MS }) {
+  clearTimeout(holdTimer);
+  overlay.dataset.tone = tone;
+  $('ov-kicker').textContent = kicker || '';
+  $('ov-name').textContent = name || '';
+  $('ov-detail').textContent = detail || '';
+  $('ov-note').textContent = note || '';
+  $('ov-note').hidden = !note;
+  overlay.style.setProperty('--hold', hold + 'ms');
+  // Restart the CSS drain animation.
+  const timer = $('ov-timer');
+  timer.style.animation = 'none';
+  void timer.offsetWidth;
+  timer.style.animation = '';
+  overlay.hidden = false;
+  paused = true;
+  holdTimer = setTimeout(resumeScanning, hold);
+}
+
+function resumeScanning() {
+  clearTimeout(holdTimer);
+  overlay.hidden = true;
+  $('enroll-sheet').hidden = true;
+  $('pin-sheet').hidden = true;
+  paused = false;
+}
+
+// Tapping a confirmation dismisses it early — a queue at the door should not
+// wait out the full four seconds.
+overlay.addEventListener('click', resumeScanning);
+
+function showFatal(title, message) {
+  paused = true;
+  $('fatal-title').textContent = title;
+  $('fatal-msg').textContent = message;
+  $('fatal-sheet').hidden = false;
+}
+
+function formatDuration(minutes) {
+  if (minutes == null) return '';
+  if (minutes < 1) return 'less than a minute';
+  if (minutes < 60) return minutes + 'm';
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m ? h + 'h ' + m + 'm' : h + 'h';
+}
+
+// ---------------------------------------------------------------------------
+// Scanning
+// ---------------------------------------------------------------------------
+
+let lastCode = null;
+let lastCodeAt = 0;
+let detect = null;               // () => Promise<string|null>
+let decoding = false;
+
+function onCode(raw) {
+  const value = String(raw || '').trim();
+
+  // Students will scan cereal boxes, posters and each other's phones to see
+  // what happens. Anything that is not a bare 7-digit payload is ignored with
+  // no feedback at all, so there is no game to play.
+  if (!isValidStudentId(value)) return;
+
+  const now = Date.now();
+  if (value === lastCode && now - lastCodeAt < REPEAT_LOCKOUT_MS) return;
+  lastCode = value;
+  lastCodeAt = now;
+
+  handleScan(value);
+}
+
+async function handleScan(studentId) {
+  paused = true;
+  const known = students.get(studentId);
+
+  // Apps Script takes a second or two. Say something immediately, using the
+  // cached name when we have one, so nobody waves their card again.
+  showOverlay({
+    tone: 'neutral',
+    kicker: known ? 'Checking in' : 'Reading card',
+    name: known ? known.name : studentId,
+    hold: 20000,
+  });
+
+  let result;
+  try {
+    result = await api.scan(studentId);
+  } catch (err) {
+    if (err instanceof ApiError && err.isNetwork) return queueScan(studentId, known);
+    return showOverlay({
+      tone: 'error',
+      kicker: 'Something went wrong',
+      name: known ? known.name : studentId,
+      detail: err.message,
+      note: 'Tell a coach',
+    });
+  }
+
+  if (result.status === 'unknown')   return openEnrollment(studentId);
+  if (result.status === 'inactive')  return showOverlay({
+    tone: 'error', kicker: 'Card not active', name: result.name || studentId,
+    detail: 'See a coach to reactivate it',
+  });
+  if (result.status === 'debounced') return showOverlay({
+    tone: 'neutral', kicker: 'Already scanned', name: result.name,
+    detail: 'Just a moment ago', hold: BRIEF_MS,
+  });
+
+  celebrate(result);
+  students.remember(studentId, {
+    name: result.name,
+    direction: result.direction,
+    since: result.direction === 'in' ? result.timestamp : null,
+  });
+
+  // A scan that got through means the network is back: drain the queue.
+  syncQueue();
+}
+
+function celebrate(result) {
+  if (result.direction === 'in') {
+    showOverlay({ tone: 'in', kicker: 'Welcome,', name: result.name, detail: "You're checked in" });
+  } else {
+    showOverlay({
+      tone: 'out',
+      kicker: 'Goodbye,',
+      name: result.name,
+      detail: formatDuration(result.duration_minutes),
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Offline queue
+// ---------------------------------------------------------------------------
+
+/**
+ * The request failed, so record the scan locally with the tablet's clock. The
+ * server writes these as flagged/unverified — which is the whole reason it
+ * refuses client timestamps in every other case.
+ */
+function queueScan(studentId, known) {
+  // Guess the direction from what this tablet last saw, so the student still
+  // gets the right greeting and the replay carries what they were told.
+  const direction = known && known.direction === 'in' ? 'out' : 'in';
+  const timestamp = new Date().toISOString();
+
+  queue.push({ student_id: studentId, timestamp, direction, attempts: 0 });
+
+  let detail = '';
+  if (direction === 'out' && known && known.since) {
+    detail = formatDuration(Math.round((Date.now() - new Date(known.since).getTime()) / 60000));
+  }
+  students.remember(studentId, {
+    name: known ? known.name : null,
+    direction,
+    since: direction === 'in' ? timestamp : null,
+  });
+
+  showOverlay({
+    tone: direction === 'in' ? 'in' : 'out',
+    kicker: direction === 'in' ? 'Welcome,' : 'Goodbye,',
+    name: (known && known.name) || studentId,
+    detail: detail || (direction === 'in' ? "You're checked in" : 'See you next time'),
+    note: 'Saved on this tablet — will sync when the internet is back',
+  });
+}
+
+let syncing = false;
+
+async function syncQueue() {
+  if (syncing || !queue.length || navigator.onLine === false) return;
+  syncing = true;
+  try {
+    const data = await api.syncQueue(
+      queue.items.map((q) => ({ student_id: q.student_id, timestamp: q.timestamp, direction: q.direction })),
+      { timeoutMs: 30000 }
+    );
+
+    // Anything the server processed — written or recognised as a duplicate —
+    // leaves the queue. Anything it rejected gets a few more tries before we
+    // drop it, so one bad entry cannot wedge the queue forever.
+    const rejected = new Map((data.rejected || []).map((r) => [r.index, r.reason]));
+    queue.items = queue.items.filter((item, index) => {
+      if (!rejected.has(index)) return false;
+      item.attempts = (item.attempts || 0) + 1;
+      if (item.attempts >= 5) {
+        console.warn('dropping queued scan after 5 attempts:', item, rejected.get(index));
+        return false;
+      }
+      return true;
+    });
+    queue.save();
+  } catch (err) {
+    // Still offline, or the server is unhappy. Keep everything and try later.
+    console.warn('queue sync failed:', err.message);
+  } finally {
+    syncing = false;
+    renderStatus();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment
+// ---------------------------------------------------------------------------
+
+let enrollingId = null;
+
+function openEnrollment(studentId) {
+  clearTimeout(holdTimer);
+  overlay.hidden = true;
+  paused = true;
+  enrollingId = studentId;
+  $('enroll-id').textContent = studentId;
+  $('enroll-name').value = '';
+  $('enroll-msg').textContent = '';
+  $('enroll-msg').removeAttribute('data-tone');
+  $('enroll-sheet').hidden = false;
+  setTimeout(() => $('enroll-name').focus(), 50);
+}
+
+async function saveEnrollment() {
+  const name = $('enroll-name').value.trim();
+  const msg = $('enroll-msg');
+  if (name.length < 2) {
+    msg.dataset.tone = 'error';
+    msg.textContent = 'Please type your full name.';
+    return;
+  }
+
+  $('enroll-save').disabled = true;
+  msg.removeAttribute('data-tone');
+  msg.textContent = 'Saving…';
+  try {
+    await api.enroll(enrollingId, name);
+    students.remember(enrollingId, { name });
+    $('enroll-sheet').hidden = true;
+    // Enrolling is not the same as arriving, so check them straight in.
+    const result = await api.scan(enrollingId);
+    if (result.status === 'ok') {
+      celebrate(result);
+      students.remember(enrollingId, { name: result.name, direction: result.direction, since: result.timestamp });
+    } else {
+      showOverlay({ tone: 'in', kicker: 'Welcome,', name, detail: "You're on the roster" });
+    }
+  } catch (err) {
+    msg.dataset.tone = 'error';
+    msg.textContent = err instanceof ApiError && err.isNetwork
+      ? 'No connection — a coach will need to add you when the internet is back.'
+      : err.message;
+    $('enroll-sheet').hidden = false;
+  } finally {
+    $('enroll-save').disabled = false;
+  }
+}
+
+$('enroll-save').addEventListener('click', saveEnrollment);
+$('enroll-cancel').addEventListener('click', () => { enrollingId = null; resumeScanning(); });
+$('enroll-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveEnrollment(); });
+
+// ---------------------------------------------------------------------------
+// Camera + decoding
+// ---------------------------------------------------------------------------
+
+async function startCamera() {
+  if (!window.isSecureContext) {
+    showFatal('Camera needs HTTPS',
+      'Open this page over https:// (GitHub Pages does this for you). Cameras are blocked on file:// and plain http://.');
+    return false;
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    showFatal('No camera support', 'This browser cannot open a camera. Try Safari or Chrome.');
+    return false;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },   // rear camera on a wall tablet
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+      },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    return true;
+  } catch (err) {
+    const messages = {
+      NotAllowedError: 'Camera permission was denied. Allow the camera in the browser settings for this page, then try again.',
+      NotFoundError: 'No camera was found on this tablet.',
+      NotReadableError: 'The camera is already in use by another app. Close it and try again.',
+    };
+    showFatal('Camera unavailable', messages[err.name] || err.message);
+    return false;
+  }
+}
+
+function loadScript(src, integrity) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = src;
+    if (integrity) { el.integrity = integrity; el.crossOrigin = 'anonymous'; }
+    el.onload = resolve;
+    el.onerror = () => reject(new Error('could not load ' + src));
+    document.head.appendChild(el);
+  });
+}
+
+/**
+ * Prefer the native BarcodeDetector — it is hardware-accelerated and costs
+ * almost nothing per frame. iPad Safari has no BarcodeDetector at all, so fall
+ * back to jsQR from a CDN, pinned with an SRI hash.
+ *
+ * Either way the detector only ever looks for QR codes. Scanning for linear
+ * formats as well would burn frames on a tablet that is already running a live
+ * camera preview, and the cards are QR.
+ */
+async function buildDetector() {
+  if ('BarcodeDetector' in window) {
+    try {
+      const formats = await window.BarcodeDetector.getSupportedFormats();
+      if (formats.includes('qr_code')) {
+        const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+        console.info('scanner: using native BarcodeDetector');
+        return async () => {
+          const codes = await detector.detect(video);
+          return codes.length ? codes[0].rawValue : null;
+        };
+      }
+    } catch (err) {
+      console.warn('BarcodeDetector unavailable, falling back to jsQR:', err);
+    }
+  }
+
+  await loadScript(JSQR_URL, JSQR_SRI);
+  if (typeof window.jsQR !== 'function') throw new Error('jsQR did not load');
+  console.info('scanner: using jsQR fallback');
+
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  return () => {
+    if (!video.videoWidth) return null;
+    // Downscale before decoding: jsQR is pure JS and 1280x720 every frame will
+    // heat up an old iPad for no extra accuracy on a card held at the reticle.
+    const scale = Math.min(1, 480 / video.videoWidth);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const code = window.jsQR(image.data, image.width, image.height, { inversionAttempts: 'dontInvert' });
+    return code ? code.data : null;
+  };
+}
+
+let lastDecodeAt = 0;
+
+function decodeLoop(timestamp) {
+  requestAnimationFrame(decodeLoop);
+  if (paused || decoding || !detect) return;
+  if (timestamp - lastDecodeAt < DECODE_INTERVAL_MS) return;
+  lastDecodeAt = timestamp;
+
+  decoding = true;
+  Promise.resolve()
+    .then(detect)
+    .then((raw) => { if (raw) onCode(raw); })
+    .catch((err) => console.warn('decode failed:', err))
+    .finally(() => { decoding = false; });
+}
+
+// ---------------------------------------------------------------------------
+// Screen wake lock — a wall tablet that sleeps is a tablet nobody can scan on
+// ---------------------------------------------------------------------------
+
+let wakeLock = null;
+
+async function keepAwake() {
+  if (!('wakeLock' in navigator)) return;       // iPad Safari: not supported, ignore
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (err) {
+    console.warn('wake lock refused:', err.message);
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    keepAwake();
+    syncQueue();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Roster priming (coaches only)
+//
+// getRoster needs the admin PIN, and a PIN stored on a wall-mounted tablet is
+// not a secret. So the tablet does not hold one: a coach long-presses the
+// status bar, types the PIN once, and the names are cached locally. The PIN
+// itself is never written to storage. Day to day this is optional — the cache
+// also fills itself from ordinary scans.
+// ---------------------------------------------------------------------------
+
+let pressTimer = null;
+const statusbar = $('statusbar');
+statusbar.addEventListener('pointerdown', () => {
+  pressTimer = setTimeout(() => {
+    paused = true;
+    $('pin-input').value = '';
+    $('pin-sheet').hidden = false;
+    setTimeout(() => $('pin-input').focus(), 50);
+  }, 1500);
+});
+['pointerup', 'pointerleave', 'pointercancel'].forEach((evt) =>
+  statusbar.addEventListener(evt, () => clearTimeout(pressTimer)));
+
+async function primeRoster() {
+  const pin = $('pin-input').value.trim();
+  const msg = $('pin-msg');
+  msg.removeAttribute('data-tone');
+  msg.textContent = 'Loading…';
+  try {
+    const data = await api.admin.getRoster(pin, { timeoutMs: 30000 });
+    for (const s of data.students) {
+      students.remember(s.student_id, {
+        name: s.name,
+        direction: s.currently_in ? 'in' : 'out',
+        since: s.current_session_since || null,
+      });
+    }
+    $('pin-input').value = '';                 // the PIN is never stored
+    showOverlay({
+      tone: 'neutral', kicker: 'Roster loaded',
+      name: data.students.length + ' students', hold: BRIEF_MS,
+    });
+  } catch (err) {
+    msg.dataset.tone = 'error';
+    msg.textContent = err.message;
+  }
+}
+
+$('pin-save').addEventListener('click', primeRoster);
+$('pin-cancel').addEventListener('click', () => { $('pin-input').value = ''; resumeScanning(); });
+$('pin-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') primeRoster(); });
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+$('fatal-retry').addEventListener('click', () => { location.reload(); });
+window.addEventListener('online', () => { renderStatus(); syncQueue(); });
+window.addEventListener('offline', renderStatus);
+
+async function boot() {
+  tickClock();
+  setInterval(tickClock, 10000);
+  renderStatus();
+  keepAwake();
+
+  // Retry anything left in the queue from last time before doing anything else.
+  syncQueue();
+  setInterval(syncQueue, SYNC_INTERVAL_MS);
+
+  if (!(await startCamera())) return;
+
+  try {
+    detect = await buildDetector();
+  } catch (err) {
+    showFatal('QR reader unavailable',
+      err.message + '. This tablet needs the internet once to load the QR reader — connect it and reload.');
+    return;
+  }
+
+  $('prompt').textContent = 'Scan your card';
+  paused = false;
+  requestAnimationFrame(decodeLoop);
+}
+
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+# Holds the deployed Apps Script Web App URL — never commit.
+config.js
+
+# macOS
+.DS_Store
