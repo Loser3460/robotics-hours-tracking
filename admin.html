@@ -327,6 +327,7 @@ const state = {
   byStudent: new Map(),
   summariesByStudent: new Map(),
   loadedAt: null,
+  summariesError: null,
   view: 'roster',          // 'roster' | 'timesheet' | 'detail'
   detailId: null,
   search: '',
@@ -577,14 +578,27 @@ function rangeLabel() {
 // ---------------------------------------------------------------------------
 
 async function load() {
+  state.summariesError = null;
   // Two calls, once. The roster carries students with no events at all (and the
   // active flag); the timesheet is fetched with NO date range so every view can
   // filter locally without going back to the network.
-  const [roster, timesheet, summaries] = await Promise.all([
+  //
+  // Summaries are fetched separately and are allowed to fail. An Apps Script
+  // deployment older than this page answers "unknown action: getSummaries",
+  // and when that was fatal it locked a coach out of the roster and timesheet
+  // entirely — over a feature they may not even be using. Now it degrades: the
+  // hours still load and a banner says what is missing and why.
+  const [roster, timesheet] = await Promise.all([
     api.admin.getRoster(state.pin, { timeoutMs: 30000 }),
     api.admin.getTimesheet(state.pin, {}, { timeoutMs: 60000 }),
-    api.admin.getSummaries(state.pin, null, { timeoutMs: 60000 }),
   ]);
+  const summaries = await api.admin.getSummaries(state.pin, null, { timeoutMs: 60000 })
+    .catch((err) => {
+      state.summariesError = /unknown action/i.test(err.message)
+        ? 'Summaries need a newer backend — redeploy the Apps Script Web App (Deploy → Manage deployments → edit → New version).'
+        : 'Summaries could not be loaded: ' + err.message;
+      return { summaries: [] };
+    });
 
   state.students = roster.students.slice().sort((a, b) => a.name.localeCompare(b.name));
   state.sessions = timesheet.sessions;
@@ -598,6 +612,7 @@ async function load() {
     list.sort((a, b) => String(a.in_time || a.out_time).localeCompare(String(b.in_time || b.out_time)));
   }
 
+  if (!state.summariesError) state.summariesError = null;
   state.summariesByStudent = new Map();
   for (const summary of summaries.summaries) {
     if (!state.summariesByStudent.has(summary.student_id)) state.summariesByStudent.set(summary.student_id, []);
@@ -647,6 +662,11 @@ function render() {
   const flagged = flagCounts();
   $('flag-count').textContent = flagged.all;
   $('flag-count').hidden = flagged.all === 0;
+
+  if (state.summariesError) {
+    $('banner-msg').textContent = state.summariesError;
+    $('banner').hidden = false;
+  }
 
   if (state.view === 'detail') $('view').innerHTML = detailHtml();
   else if (state.view === 'timesheet') $('view').innerHTML = timesheetHtml();

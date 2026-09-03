@@ -28,7 +28,9 @@
 
 // Bump this on release to retire the old cache. Anything cached under a
 // previous version is deleted on activate.
-const VERSION = 'v1';
+// v2: front-facing camera on the tablet. Bumping this forces every installed
+// tablet to refetch the shell instead of serving a cached scanner.js.
+const VERSION = 'v2';
 const CACHE = 'lab-shell-' + VERSION;
 
 /** Everything needed to boot the scanner with no network at all. */

@@ -20,8 +20,12 @@
   #video {
     width: 100%; height: 100%;
     object-fit: cover;
-    /* The rear camera is not mirrored; do not transform it or the QR reads fine
-       but the picture confuses anyone lining up their card. */
+    /* Mirrored, because this is the FRONT camera and an unmirrored selfie view
+       is backwards: the student moves the card left and it goes right on
+       screen. Decoding is unaffected — BarcodeDetector reads the video frames
+       and jsQR reads a canvas drawn from them, and neither sees a CSS
+       transform. Do not add this to a rear-camera view. */
+    transform: scaleX(-1);
   }
 
   /* ---- aiming reticle ---- */
@@ -642,7 +646,10 @@ async function boot() {
   syncQueue();
   setInterval(syncQueue, SYNC_INTERVAL_MS);
 
-  scanner = createScanner(video, handleScan);
+  // Front camera. The iPad is wall-mounted with its screen facing the room, so
+  // the rear camera points at the wall and the front one is the only camera
+  // that can see a student's card.
+  scanner = createScanner(video, handleScan, { facingMode: 'user' });
   try {
     await scanner.start();
   } catch (err) {
