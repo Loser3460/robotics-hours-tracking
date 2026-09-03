@@ -25,8 +25,22 @@
 // One definition of what a student ID looks like, shared with the API client.
 import { isValidStudentId } from './api.js';
 
-const JSQR_URL = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
-const JSQR_SRI = 'sha384-b5Ya4Bq3qCyz39m2ISh+4DxjAIljdeFwK/BsXLuj9gugaNwAcj/ia15fxNZL9Nlx';
+/**
+ * jsQR 1.4.0, vendored at js/vendor/jsqr.js.
+ *
+ * Served from our own origin on purpose. The lab tablet is an iPad, which has
+ * no BarcodeDetector, so jsQR is the ONLY way it decodes anything — fetching it
+ * from a CDN would mean the scanner cannot read a card whenever the wifi is
+ * down, which is exactly when the offline queue is supposed to save the day. A
+ * local copy is also one less third-party script running on a page that handles
+ * student data, and it is what the service worker precaches.
+ *
+ * Resolved against this module's own URL so it does not matter which page loads
+ * it, or what subdirectory the site is served from.
+ * Upstream: https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js
+ * sha384-b5Ya4Bq3qCyz39m2ISh+4DxjAIljdeFwK/BsXLuj9gugaNwAcj/ia15fxNZL9Nlx
+ */
+const JSQR_URL = new URL('./vendor/jsqr.js', import.meta.url).href;
 
 const DEFAULTS = {
   decodeIntervalMs: 120,     // ~8 looks per second; faster only burns battery
@@ -59,13 +73,10 @@ function loadJsQr() {
     jsqrPromise = new Promise((resolve, reject) => {
       const el = document.createElement('script');
       el.src = JSQR_URL;
-      el.integrity = JSQR_SRI;      // pinned: a third-party script on a page handling student data
-      el.crossOrigin = 'anonymous';
       el.onload = () => (typeof window.jsQR === 'function'
         ? resolve(window.jsQR)
         : reject(new CameraError('the QR reader loaded but did not register', 'reader')));
-      el.onerror = () => reject(new CameraError(
-        'could not load the QR reader — this device needs the internet once to fetch it', 'reader'));
+      el.onerror = () => reject(new CameraError('could not load the QR reader', 'reader'));
       document.head.appendChild(el);
     });
     jsqrPromise.catch(() => { jsqrPromise = null; });   // let a later attempt retry

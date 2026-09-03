@@ -10,6 +10,9 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#0d1117">
 <title>Lab Scanner</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/favicon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="stylesheet" href="css/styles.css">
 <style>
   /* ---- camera stage ---- */
@@ -636,6 +639,25 @@ async function boot() {
 }
 
 boot();
+
+// ---------------------------------------------------------------------------
+// Install the service worker.
+//
+// Registered from this page only. The tablet is what gets installed to a home
+// screen and what has to survive a wifi drop; a coach's laptop opening the
+// admin page should keep talking to the network normally rather than picking up
+// a cached app shell. The worker's scope still covers the whole site, so once
+// the tablet has it, every page on the tablet is cached.
+//
+// It never caches API traffic — see the note at the top of sw.js.
+// ---------------------------------------------------------------------------
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js')
+      .then((reg) => console.info('scanner: offline shell ready', reg.scope))
+      .catch((err) => console.warn('scanner: service worker registration failed', err));
+  });
+}
 </script>
 </body>
 </html>

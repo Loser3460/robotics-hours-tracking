@@ -69,6 +69,21 @@ const detector = new BarcodeDetector({ formats: ['qr_code'] });
 Do not scan for linear/1D formats. It wastes frames on a tablet that is already running
 a live camera feed.
 
+### 5. The service worker caches the shell, never the API
+
+`sw.js` handles **only same-origin GET** requests. Every API call is a POST to
+`script.google.com`, so it fails both tests and goes straight to the network.
+
+This is not a style preference. A stale cached roster would show an old name; a
+stale cached *scan response* would tell a student "you're checked out" while
+nothing reached the sheet, and would make a failed scan look successful so the
+offline queue never fires. Do not add same-origin API endpoints without changing
+that rule alongside them.
+
+Pages are network-first (so a deploy lands immediately, with cache as the
+offline fallback); static assets are stale-while-revalidate. Bump `VERSION` in
+`sw.js` to retire an old cache.
+
 ## Sheet schema
 
 Four tabs. Column order is the contract — Apps Script reads by index, so do not reorder
@@ -112,12 +127,17 @@ or insert columns in the middle.
 ## Files
 
 ```
-index.html              scanner (tablet)
-admin.html              roster, timesheet, student detail
+index.html              scanner (tablet) — registers the service worker
+admin.html              roster, timesheet, needs-review queue, student detail
 summary.html            student summary submission (phone)
 css/styles.css          shared styles
 js/api.js               shared API client — the only place fetch() is called
+js/scanner.js           reusable QR scanner: camera lifecycle + decode loop
+js/vendor/jsqr.js       vendored jsQR 1.4.0 — the iPad's only decode path
 config.js               the deployed Apps Script URL (committed — see Secrets)
+sw.js                   service worker — caches the shell, never the API
+manifest.webmanifest    Add to Home Screen metadata
+icons/                  app icons (192, 512, maskable, apple-touch, favicon)
 apps-script/Code.gs     the entire backend
 ```
 

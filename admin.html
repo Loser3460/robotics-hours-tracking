@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#0d1117">
 <title>Lab Hours — Admin</title>
+<!-- Icons only: the service worker is registered by the tablet page, so a
+     browser that only ever opens this page is never served a cached shell. -->
+<link rel="icon" href="icons/favicon-32.png" sizes="32x32">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="stylesheet" href="css/styles.css">
 <style>
   /* The tablet page is sized to be read across a room. This one is a dense
@@ -192,6 +196,28 @@
   }
   .btn-danger { background: var(--error); border-color: var(--error-bright); }
 
+  /* ---- flagged review queue ---- */
+  .chips { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+  .chip {
+    min-height: 2.5rem; padding: 0 0.9rem;
+    border: 1px solid var(--border); border-radius: 999px;
+    background: transparent; color: var(--text-dim);
+    font: inherit; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+  }
+  .chip[aria-pressed="true"] { background: var(--bg-raised); color: var(--text); border-color: var(--out-bright); }
+  .chip__n { opacity: 0.7; margin-left: 0.35em; font-variant-numeric: tabular-nums; }
+  .who-link {
+    display: block; margin-top: 0.15rem; padding: 0;
+    background: none; border: 0; color: var(--out-bright);
+    font: inherit; font-size: 0.875rem; font-weight: 600; text-align: left; cursor: pointer;
+  }
+  .who-link:hover { text-decoration: underline; }
+  .tab__count {
+    display: inline-block; min-width: 1.4em; margin-left: 0.4em; padding: 0.05em 0.4em;
+    border-radius: 999px; background: var(--warn); color: #fff;
+    font-size: 0.75rem; font-variant-numeric: tabular-nums;
+  }
+
   /* ---- summaries ---- */
   .summary {
     padding: 1rem;
@@ -260,6 +286,7 @@
     <div class="tabs" role="tablist">
       <button class="tab" id="tab-roster" role="tab" aria-selected="true">Roster</button>
       <button class="tab" id="tab-timesheet" role="tab" aria-selected="false">Timesheet</button>
+      <button class="tab" id="tab-flagged" role="tab" aria-selected="false">Needs review<span class="tab__count" id="flag-count" hidden></span></button>
     </div>
     <span class="topbar__spacer"></span>
     <span class="muted" id="freshness" style="font-size:0.875rem"></span>
@@ -307,6 +334,7 @@ const state = {
   to: '',
   showInactive: false,
   sort: { key: 'name', dir: 1 },
+  flagFilter: 'all',
   editing: null,           // session key being edited
   confirming: null,        // session key awaiting delete confirmation
   adding: false,
@@ -500,6 +528,43 @@ function driveId(url) {
   return m ? m[1] : null;
 }
 
+/**
+ * Every session that wants a human look, newest first.
+ *
+ * Deliberately ignores the timesheet's date range: this is a review queue, and
+ * a filter that quietly hides a broken session from three weeks ago is how a
+ * broken session survives to the end of the season.
+ */
+function flaggedSessions() {
+  const term = state.search.trim().toLowerCase();
+  return state.sessions
+    .filter((s) => s.flagged || s.needs_review)
+    .filter((s) => flagCategories(s).includes(state.flagFilter) || state.flagFilter === 'all')
+    .filter((s) => !term || String(s.name || '').toLowerCase().includes(term) || s.student_id.includes(term))
+    .sort((a, b) => String(b.in_time || b.out_time).localeCompare(String(a.in_time || a.out_time)));
+}
+
+/** Why a session is in the queue. A session can be in more than one bucket. */
+function flagCategories(s) {
+  const sources = s.sources || [];
+  const out = [];
+  if (s.needs_review) out.push('review');
+  if (sources.includes('auto-close')) out.push('auto');
+  if (sources.includes('offline')) out.push('offline');
+  if (sources.includes('admin')) out.push('admin');
+  return out;
+}
+
+function flagCounts() {
+  const counts = { all: 0, review: 0, auto: 0, offline: 0, admin: 0 };
+  for (const s of state.sessions) {
+    if (!s.flagged && !s.needs_review) continue;
+    counts.all++;
+    for (const c of flagCategories(s)) counts[c]++;
+  }
+  return counts;
+}
+
 function rangeLabel() {
   if (!state.from && !state.to) return 'All time';
   if (state.from && state.to) return fmtDate(state.from + 'T12:00') + ' – ' + fmtDate(state.to + 'T12:00');
@@ -577,9 +642,15 @@ function render() {
     : '';
   $('tab-roster').setAttribute('aria-selected', String(state.view === 'roster'));
   $('tab-timesheet').setAttribute('aria-selected', String(state.view === 'timesheet'));
+  $('tab-flagged').setAttribute('aria-selected', String(state.view === 'flagged'));
+
+  const flagged = flagCounts();
+  $('flag-count').textContent = flagged.all;
+  $('flag-count').hidden = flagged.all === 0;
 
   if (state.view === 'detail') $('view').innerHTML = detailHtml();
   else if (state.view === 'timesheet') $('view').innerHTML = timesheetHtml();
+  else if (state.view === 'flagged') $('view').innerHTML = flaggedHtml();
   else $('view').innerHTML = rosterHtml();
 
   if (focusId && $(focusId)) {
@@ -800,6 +871,49 @@ function timesheetHtml() {
     </div>`;
 }
 
+// ---- Needs review ---------------------------------------------------------
+
+function flaggedHtml() {
+  const counts = flagCounts();
+  const rows = flaggedSessions();
+  const chip = (key, label) => `
+    <button class="chip" data-action="flag-filter" data-filter="${key}"
+            aria-pressed="${state.flagFilter === key}">${label}<span class="chip__n">${counts[key]}</span></button>`;
+
+  return `
+    <div class="controls">
+      <div class="control">
+        <span class="control__label">Show</span>
+        <div class="chips">
+          ${chip('all', 'Everything flagged')}
+          ${chip('review', 'Broken sessions')}
+          ${chip('auto', 'Auto-closed')}
+          ${chip('offline', 'Offline replay')}
+          ${chip('admin', 'Hand-corrected')}
+        </div>
+      </div>
+      <div class="control">
+        <label class="control__label" for="search">Search</label>
+        <input class="input input--search" id="search" type="search" placeholder="Name or ID"
+               value="${esc(state.search)}" autocomplete="off">
+      </div>
+    </div>
+
+    ${counts.review ? `<div class="banner" style="border-color:var(--warn);background:rgba(210,153,34,0.12)">
+        <span>⚠ ${counts.review} session${counts.review === 1 ? ' has' : 's have'} a missing or impossible
+        check-in/check-out and ${counts.review === 1 ? 'is' : 'are'} not counting toward anyone's hours.</span>
+      </div>` : ''}
+
+    <p class="muted" style="margin:0 0 0.75rem">
+      ${rows.length} session${rows.length === 1 ? '' : 's'} shown · all dates
+    </p>
+
+    <div class="card">
+      ${rows.map((s) => sessionRowHtml(s, { showStudent: true })).join('')
+        || '<div class="empty">Nothing needs review. 🎉</div>'}
+    </div>`;
+}
+
 // ---- Student detail -------------------------------------------------------
 
 function detailHtml() {
@@ -946,7 +1060,7 @@ const PROBLEM = {
   reversed: { pill: 'error',  text: 'Times reversed', why: 'The check-out is earlier than the check-in, so this session has no usable duration.' },
 };
 
-function sessionRowHtml(s) {
+function sessionRowHtml(s, opts = {}) {
   const key = sessionKey(s);
   const problem = PROBLEM[s.status];
   const autoClosed = (s.sources || []).includes('auto-close');
@@ -967,7 +1081,11 @@ function sessionRowHtml(s) {
 
   return `
     <div class="session${problem ? ' session--problem' : ''}">
-      <div class="session__date">${fmtDate(s.in_time || s.out_time)}</div>
+      <div>
+        <div class="session__date">${fmtDate(s.in_time || s.out_time)}</div>
+        ${opts.showStudent ? `<button class="who-link" data-action="open" data-id="${esc(s.student_id)}"
+            >${esc(s.name || s.student_id)}</button>` : ''}
+      </div>
       <div class="session__times">
         ${s.in_time ? fmtTime(s.in_time) : '<span class="muted">—</span>'}
         →
@@ -1238,6 +1356,7 @@ $('view').addEventListener('click', (event) => {
                           : { key: el.dataset.key, dir: el.dataset.key === 'name' ? 1 : -1 };
                         render(); break;
     case 'preset':      applyPreset(preset); render(); break;
+    case 'flag-filter': state.flagFilter = el.dataset.filter; render(); break;
     case 'export':      exportCsv(); break;
     case 'edit':        state.editing = state.editing === key ? null : key;
                         state.confirming = null; render(); break;
@@ -1262,6 +1381,9 @@ $('tab-roster').addEventListener('click', () => {
 });
 $('tab-timesheet').addEventListener('click', () => {
   state.view = 'timesheet'; state.detailId = null; render();
+});
+$('tab-flagged').addEventListener('click', () => {
+  state.view = 'flagged'; state.detailId = null; render();
 });
 $('refresh').addEventListener('click', refresh);
 $('banner-retry').addEventListener('click', refresh);
