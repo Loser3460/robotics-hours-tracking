@@ -164,11 +164,13 @@ function doPost(e) {
       case 'enroll':        return json_(actionEnroll_(payload));
       case 'syncQueue':     return json_(actionSyncQueue_(payload));
       case 'submitSummary': return json_(actionSubmitSummary_(payload));
+      case 'lookupStudent': return json_(actionLookupStudent_(payload));
 
       // Admin actions — every one of these requires the PIN in the body.
       case 'getRoster':     return json_(actionGetRoster_(payload));
       case 'getTimesheet':  return json_(actionGetTimesheet_(payload));
       case 'getStudent':    return json_(actionGetStudent_(payload));
+      case 'getSummaries':  return json_(actionGetSummaries_(payload));
       case 'editEvent':     return json_(actionEditEvent_(payload));
       case 'deleteEvent':   return json_(actionDeleteEvent_(payload));
       case 'setActive':     return json_(actionSetActive_(payload));
@@ -841,6 +843,77 @@ function lastBefore_(sortedEvents, ts) {
 }
 
 // ---------------------------------------------------------------------------
+// Action: lookupStudent
+// ---------------------------------------------------------------------------
+
+/**
+ * Confirm an ID belongs to somebody, and describe their lab time on one day.
+ *
+ * The summary page needs this before a student writes anything: it shows the
+ * name back so they know they typed the right number, and it prefills the
+ * session they are writing about.
+ *
+ * Deliberately unauthenticated, like `scan` and `enroll`. It exposes no more
+ * than `scan` already does — a name for an ID you had to know, plus that day's
+ * in/out times — and unlike `scan` it writes nothing at all, so pointing the
+ * summary page at it can never create attendance. It returns ONLY the requested
+ * day: no history, no totals, no roster listing.
+ */
+function actionLookupStudent_(p) {
+  var studentId = requireId_(p.student_id);
+  var date = String(p.date || '').trim();
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) fail_('date must be YYYY-MM-DD');
+
+  var student = studentIndex_(readTable_(TAB_STUDENTS))[studentId];
+  if (!student) return ok_({ found: false, student_id: studentId });
+
+  var out = {
+    found: true,
+    student_id: studentId,
+    name: student.name,
+    grade: student.grade,
+    active: student.active
+  };
+
+  if (date) {
+    var events = groupByStudent_(resolveEvents_(readTable_(TAB_EVENTS)))[studentId] || [];
+    var sessions = [];
+    var all = buildSessions_(events);
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].date !== date) continue;
+      sessions.push({
+        status: all[i].status,
+        in_time: all[i].in_time,
+        out_time: all[i].out_time,
+        in_clock: all[i].in_clock,
+        out_clock: all[i].out_clock,
+        minutes: all[i].minutes,
+        flagged: all[i].flagged
+      });
+    }
+    out.date = date;
+    out.sessions = sessions;
+
+    var summaries = readTable_(TAB_SUMMARIES);
+    var already = 0;
+    for (var s = 0; s < summaries.length; s++) {
+      if (normId_(summaries[s].student_id) !== studentId) continue;
+      if (summaryDate_(summaries[s]) === date) already++;
+    }
+    out.summaries_on_date = already;
+  }
+
+  return ok_(out);
+}
+
+/** session_date can come back as text or as a Date, depending on the cell. */
+function summaryDate_(row) {
+  return row.session_date instanceof Date
+    ? dateKey_(row.session_date)
+    : String(row.session_date || '').trim();
+}
+
+// ---------------------------------------------------------------------------
 // Action: submitSummary
 // ---------------------------------------------------------------------------
 
@@ -1119,15 +1192,11 @@ function actionGetStudent_(p) {
   var summaryRows = readTable_(TAB_SUMMARIES);
   for (var s = 0; s < summaryRows.length; s++) {
     if (normId_(summaryRows[s].student_id) !== studentId) continue;
-    var urls = String(summaryRows[s].photo_urls || '').split(',');
-    var clean = [];
-    for (var u = 0; u < urls.length; u++) if (urls[u].trim()) clean.push(urls[u].trim());
     summaries.push({
       summary_id: String(summaryRows[s].summary_id || ''),
-      session_date: summaryRows[s].session_date instanceof Date
-        ? dateKey_(summaryRows[s].session_date) : String(summaryRows[s].session_date || ''),
+      session_date: summaryDate_(summaryRows[s]),
       text: String(summaryRows[s].text || ''),
-      photo_urls: clean,
+      photo_urls: splitUrls_(summaryRows[s].photo_urls),
       submitted_at: summaryRows[s].submitted_at instanceof Date
         ? toIso_(summaryRows[s].submitted_at) : String(summaryRows[s].submitted_at || '')
     });
@@ -1232,6 +1301,43 @@ function actionDeleteEvent_(p) {
       student_id: target.student_id
     });
   });
+}
+
+/**
+ * Every summary, for the admin page. Fetched once at unlock alongside the
+ * roster and the timesheet, so opening a student's detail view needs no
+ * further request.
+ */
+function actionGetSummaries_(p) {
+  requirePin_(p);
+  var studentId = p.student_id ? requireId_(p.student_id) : null;
+  var rows = readTable_(TAB_SUMMARIES);
+  var out = [];
+  for (var i = 0; i < rows.length; i++) {
+    var sid = normId_(rows[i].student_id);
+    if (!sid) continue;
+    if (studentId && sid !== studentId) continue;
+    out.push({
+      summary_id: String(rows[i].summary_id || ''),
+      student_id: sid,
+      session_date: summaryDate_(rows[i]),
+      text: String(rows[i].text || ''),
+      photo_urls: splitUrls_(rows[i].photo_urls),
+      submitted_at: rows[i].submitted_at instanceof Date
+        ? toIso_(rows[i].submitted_at) : String(rows[i].submitted_at || '')
+    });
+  }
+  out.sort(function (a, b) { return a.submitted_at < b.submitted_at ? 1 : -1; });
+  return ok_({ summaries: out, count: out.length, generated_at: nowIso_() });
+}
+
+function splitUrls_(value) {
+  var parts = String(value || '').split(',');
+  var out = [];
+  for (var i = 0; i < parts.length; i++) {
+    if (parts[i].trim()) out.push(parts[i].trim());
+  }
+  return out;
 }
 
 function findEvent_(events, eventId) {

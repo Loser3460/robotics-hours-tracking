@@ -151,6 +151,18 @@ export function syncQueue(scans, options = {}) {
   return request('syncQueue', { scans }, options);
 }
 
+/**
+ * Confirm an ID and, given a date, describe that day's lab time.
+ * Resolves to {found:false} for an unknown ID rather than throwing — the
+ * summary page treats that as "check the number", not as an error.
+ * Writes nothing; safe to call as the student types.
+ */
+export function lookupStudent(studentId, date = null, options = {}) {
+  const payload = { student_id: studentId };
+  if (date) payload.date = date;
+  return request('lookupStudent', payload, options);
+}
+
 /** photos: array of data: URLs or {name, mimeType, data} objects. */
 export function submitSummary(studentId, text, photos = [], sessionDate = null, options = {}) {
   const payload = { student_id: studentId, text, photos };
@@ -167,6 +179,9 @@ export const admin = {
   getTimesheet: (pin, { from = null, to = null, studentId = null } = {}, options = {}) =>
     request('getTimesheet', { pin, from, to, student_id: studentId }, options),
   getStudent: (pin, studentId, options = {}) => request('getStudent', { pin, student_id: studentId }, options),
+  /** Every summary in one call, or one student's with studentId. */
+  getSummaries: (pin, studentId = null, options = {}) =>
+    request('getSummaries', studentId ? { pin, student_id: studentId } : { pin }, options),
   /** Appends a correction; the original event row is never modified. */
   editEvent: (pin, eventId, { timestamp = null, direction = null, reason = '' } = {}, options = {}) =>
     request('editEvent', { pin, event_id: eventId, timestamp, direction, reason }, options),

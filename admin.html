@@ -192,6 +192,27 @@
   }
   .btn-danger { background: var(--error); border-color: var(--error-bright); }
 
+  /* ---- summaries ---- */
+  .summary {
+    padding: 1rem;
+    border-top: 1px solid var(--border);
+    border-left: 3px solid var(--out-bright);
+    background: rgba(88, 166, 255, 0.05);
+  }
+  .summary__head { display: flex; gap: 0.6rem; align-items: baseline; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .summary__label { font-weight: 700; color: var(--out-bright); font-size: 0.875rem; letter-spacing: 0.02em; }
+  .summary__text { margin: 0; white-space: pre-wrap; line-height: 1.55; overflow-wrap: anywhere; }
+  .summary__photos { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.75rem; }
+  .summary__photo {
+    display: block; width: 7rem; height: 7rem; border-radius: 0.5rem; overflow: hidden;
+    border: 1px solid var(--border); background: var(--bg);
+  }
+  .summary__photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .summary__photo--broken {
+    display: flex; align-items: center; justify-content: center; padding: 0.4rem;
+    font-size: 0.75rem; text-align: center; color: var(--out-bright);
+  }
+
   /* ---- misc ---- */
   .card { border: 1px solid var(--border); border-radius: 0.75rem; background: var(--bg-raised); }
   .banner {
@@ -277,6 +298,7 @@ const state = {
   students: [],
   sessions: [],
   byStudent: new Map(),
+  summariesByStudent: new Map(),
   loadedAt: null,
   view: 'roster',          // 'roster' | 'timesheet' | 'detail'
   detailId: null,
@@ -448,6 +470,36 @@ function sessionsOf(studentId) {
   return state.byStudent.get(studentId) || [];
 }
 
+function summariesOf(studentId) {
+  return state.summariesByStudent.get(studentId) || [];
+}
+
+/**
+ * Sessions and summaries in one newest-first list, so a writeup sits directly
+ * under the session it describes. A summary is pinned to the start of its own
+ * day, which puts it below that day's sessions in a descending list — and a
+ * summary written for a day with no recorded lab time still shows up.
+ */
+function timelineFor(studentId) {
+  const items = sessionsOf(studentId).map((session) => ({
+    kind: 'session', at: session.in_time || session.out_time, session,
+  }));
+  for (const summary of summariesOf(studentId)) {
+    items.push({ kind: 'summary', at: (summary.session_date || '') + 'T00:00:01', summary });
+  }
+  return items.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+}
+
+/**
+ * Drive's uc?export=view links are unreliable inside an <img>. The file id is
+ * the durable part, so pull it out and use the thumbnail endpoint for display
+ * and the file viewer for full size.
+ */
+function driveId(url) {
+  const m = /[?&]id=([A-Za-z0-9_-]+)/.exec(url) || /\/d\/([A-Za-z0-9_-]+)/.exec(url);
+  return m ? m[1] : null;
+}
+
 function rangeLabel() {
   if (!state.from && !state.to) return 'All time';
   if (state.from && state.to) return fmtDate(state.from + 'T12:00') + ' – ' + fmtDate(state.to + 'T12:00');
@@ -463,9 +515,10 @@ async function load() {
   // Two calls, once. The roster carries students with no events at all (and the
   // active flag); the timesheet is fetched with NO date range so every view can
   // filter locally without going back to the network.
-  const [roster, timesheet] = await Promise.all([
+  const [roster, timesheet, summaries] = await Promise.all([
     api.admin.getRoster(state.pin, { timeoutMs: 30000 }),
     api.admin.getTimesheet(state.pin, {}, { timeoutMs: 60000 }),
+    api.admin.getSummaries(state.pin, null, { timeoutMs: 60000 }),
   ]);
 
   state.students = roster.students.slice().sort((a, b) => a.name.localeCompare(b.name));
@@ -478,6 +531,12 @@ async function load() {
   // Oldest first, so session lists and weekly buckets read chronologically.
   for (const list of state.byStudent.values()) {
     list.sort((a, b) => String(a.in_time || a.out_time).localeCompare(String(b.in_time || b.out_time)));
+  }
+
+  state.summariesByStudent = new Map();
+  for (const summary of summaries.summaries) {
+    if (!state.summariesByStudent.has(summary.student_id)) state.summariesByStudent.set(summary.student_id, []);
+    state.summariesByStudent.get(summary.student_id).push(summary);
   }
   state.loadedAt = new Date();
 }
@@ -750,7 +809,8 @@ function detailHtml() {
   const sessions = sessionsOf(student.student_id);
   const st = statsFor(sessions);
   const weeks = weeklyHours(sessions);
-  const newestFirst = sessions.slice().reverse();
+  const timeline = timelineFor(student.student_id);
+  const summaryCount = summariesOf(student.student_id).length;
 
   return `
     <button class="back" data-action="back">← All students</button>
@@ -797,9 +857,13 @@ function detailHtml() {
     <div class="card">
       <div style="padding:0.9rem 1rem;border-bottom:1px solid var(--border)">
         <strong>${sessions.length} session${sessions.length === 1 ? '' : 's'}</strong>
+        ${summaryCount ? `<strong> · ${summaryCount} summar${summaryCount === 1 ? 'y' : 'ies'}</strong>` : ''}
         <span class="muted">· newest first</span>
       </div>
-      ${newestFirst.map(sessionRowHtml).join('') || '<div class="empty">No sessions recorded.</div>'}
+      ${timeline.map((item) => item.kind === 'session'
+          ? sessionRowHtml(item.session)
+          : summaryRowHtml(item.summary)).join('')
+        || '<div class="empty">Nothing recorded yet.</div>'}
     </div>`;
 }
 
@@ -917,6 +981,31 @@ function sessionRowHtml(s) {
       </div>
       ${state.editing === key ? editorHtml(s) : ''}
       ${state.confirming === key ? confirmHtml(s) : ''}
+    </div>`;
+}
+
+function summaryRowHtml(summary) {
+  const photos = (summary.photo_urls || []).map((url) => {
+    const id = driveId(url);
+    const full = id ? 'https://drive.google.com/file/d/' + id + '/view' : url;
+    const thumb = id ? 'https://drive.google.com/thumbnail?id=' + id + '&sz=w400' : url;
+    // Drive can refuse to serve an image cross-origin; degrade to a link rather
+    // than leaving a broken-image icon on the page.
+    return `<a class="summary__photo" href="${esc(full)}" target="_blank" rel="noopener" title="Open full size">
+      <img src="${esc(thumb)}" alt="Photo from ${esc(summary.session_date)}" loading="lazy"
+           onerror="this.parentNode.classList.add('summary__photo--broken');this.parentNode.textContent='Open photo in Drive';">
+    </a>`;
+  }).join('');
+
+  return `
+    <div class="summary">
+      <div class="summary__head">
+        <span class="summary__label">SUMMARY</span>
+        <span class="session__date">${fmtDate(summary.session_date + 'T12:00')}</span>
+        <span class="muted" style="font-size:0.8125rem">submitted ${fmtWhen(summary.submitted_at)}</span>
+      </div>
+      <p class="summary__text">${esc(summary.text)}</p>
+      ${photos ? `<div class="summary__photos">${photos}</div>` : ''}
     </div>`;
 }
 
