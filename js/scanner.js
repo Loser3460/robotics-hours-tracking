@@ -45,7 +45,7 @@ const JSQR_URL = new URL('./vendor/jsqr.js', import.meta.url).href;
 const DEFAULTS = {
   decodeIntervalMs: 120,     // ~8 looks per second; faster only burns battery
   repeatLockoutMs: 6000,     // ignore the same card sitting in frame
-  facingMode: 'environment', // rear camera: the tablet is wall-mounted, the phone is held
+  facingMode: 'user', // rear camera: the tablet is wall-mounted, the phone is held
   jsqrWidth: 480,            // downscale before software decoding
 };
 
