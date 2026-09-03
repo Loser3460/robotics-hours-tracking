@@ -117,8 +117,7 @@ admin.html              roster, timesheet, student detail
 summary.html            student summary submission (phone)
 css/styles.css          shared styles
 js/api.js               shared API client — the only place fetch() is called
-config.example.js       template; copy to config.js
-config.js               GITIGNORED — holds the deployed Apps Script URL
+config.js               the deployed Apps Script URL (committed — see Secrets)
 apps-script/Code.gs     the entire backend
 ```
 
@@ -129,7 +128,17 @@ call `fetch` themselves.
 
 - **Never commit a real student ID.** Use `1234567` as the dummy ID in all test code,
   examples, and documentation.
-- **Never commit the deployed Apps Script URL.** It lives in `config.js`, which is
-  gitignored. `config.example.js` is checked in as the template.
+- **The deployed Apps Script URL is public, by decision.** It lives in `config.js`,
+  which IS committed. A static GitHub Pages site cannot hold a secret: anything the
+  browser needs to send a request, a visitor can read from the network tab. Keeping
+  the file out of the repo would only have hidden the URL from scrapers, not from
+  anyone loading the page.
+- **Consequences to design around.** `scan` and `enroll` take no PIN, so anyone with
+  the URL can append events. That is accepted: `Events` is append-only, `enroll`
+  rejects duplicates, `scan` only accepts IDs already on the roster, and a coach
+  voids junk with `deleteEvent` while the originals stay visible for audit. Treat
+  stray rows as maintenance, not as a breach.
+- **The admin PIN is the one real secret, and it is not in this repo.** It lives only
+  in the `Config` tab of the Sheet. Never put it in `config.js` or any committed file.
 - This project sits inside a git repository rooted at the user's home directory. Verify
   what is staged before committing; do not `git add -A` from the repo root.
