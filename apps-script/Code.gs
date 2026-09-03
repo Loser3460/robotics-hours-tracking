@@ -465,10 +465,24 @@ function groupByStudent_(events) {
 
 /**
  * Pair a single student's events into sessions.
- *   closed   — an IN matched by an OUT
- *   open     — the last IN, still unmatched: the student is in the lab now
- *   unclosed — an IN followed by another IN; the first is broken and needs review
- * Only closed sessions contribute to totals.
+ *
+ *   closed   — an IN matched by an OUT: the normal case, the only one that counts
+ *   open     — the last IN, still unmatched: the student is in the lab right now
+ *   unclosed — an IN followed by another IN; the first never got an OUT
+ *   orphan   — an OUT with no IN before it
+ *   reversed — an OUT that lands BEFORE its IN, which would give negative time
+ *
+ * The last three are broken logs, not attendance. They are still returned, every
+ * one of them carrying needs_review and a null duration, because the admin page
+ * has to be able to show a coach what is wrong and let them fix it. Dropping
+ * them here would make an orphan OUT invisible in every view — the row would
+ * simply never appear, and nobody would know to correct it.
+ *
+ * 'reversed' cannot happen on the normal path: resolveEvents_ sorts ascending,
+ * so an OUT always lands at or after the IN it closes, and a negative duration
+ * is impossible by construction. The branch is kept as a guard — if the ordering
+ * ever changes, a bad pair degrades into a flagged row with a null duration
+ * instead of silently reporting "-142 min" or clamping to zero.
  */
 function buildSessions_(events) {
   var sessions = [];
@@ -479,15 +493,41 @@ function buildSessions_(events) {
       if (open) sessions.push(makeSession_(open, null, 'unclosed'));
       open = e;
     } else {
-      if (open) { sessions.push(makeSession_(open, e, 'closed')); open = null; }
-      // An OUT with no matching IN is an orphan; it opens nothing and is skipped.
+      if (open) {
+        var backwards = e.ts.getTime() < open.ts.getTime();
+        sessions.push(makeSession_(open, e, backwards ? 'reversed' : 'closed'));
+        open = null;
+      } else {
+        sessions.push(makeOrphan_(e));
+      }
     }
   }
   if (open) sessions.push(makeSession_(open, null, 'open'));
   return sessions;
 }
 
+/** An OUT with nothing before it. There is no start time, so there is no duration. */
+function makeOrphan_(outEv) {
+  return {
+    student_id: outEv.student_id,
+    date: dateKey_(outEv.ts),
+    status: 'orphan',
+    in_event_id: null,
+    out_event_id: outEv.event_id,
+    in_time: null,
+    out_time: outEv.timestamp,
+    in_clock: null,
+    out_clock: timeKey_(outEv.ts),
+    minutes: null,
+    flagged: !!outEv.flagged,
+    needs_review: true,
+    sources: [outEv.source]
+  };
+}
+
 function makeSession_(inEv, outEv, status) {
+  // Only a well-formed session has a duration. 'unclosed' and 'reversed' report
+  // null rather than a guess, so nothing downstream can sum a broken row.
   var minutes = null;
   if (status === 'closed') minutes = Math.max(0, minutesBetween_(inEv.ts, outEv.ts));
   else if (status === 'open') minutes = Math.max(0, minutesBetween_(inEv.ts, new Date()));
@@ -503,7 +543,7 @@ function makeSession_(inEv, outEv, status) {
     out_clock: outEv ? timeKey_(outEv.ts) : null,
     minutes: minutes,
     flagged: !!(inEv.flagged || (outEv && outEv.flagged)),
-    needs_review: status === 'unclosed',
+    needs_review: status !== 'closed' && status !== 'open',
     sources: outEv ? [inEv.source, outEv.source] : [inEv.source]
   };
 }

@@ -1,1 +1,1227 @@
-<!-- admin: roster, timesheet, student detail -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0d1117">
+<title>Lab Hours — Admin</title>
+<link rel="stylesheet" href="css/styles.css">
+<style>
+  /* The tablet page is sized to be read across a room. This one is a dense
+     desktop report, so it steps the type back down and reuses only the tokens. */
+  :root {
+    /* Validated with the dataviz palette checker against the #161b22 chart
+       surface: inside the dark-mode lightness band and over 3:1 contrast.
+       #58a6ff, the obvious pick from the shared tokens, fails the band. */
+    --chart-bar: #388bfd;
+  }
+  /* styles.css pins html/body to 100% height for the tablet's fixed, unscrollable
+     surface. This page is a long report, so hand scrolling back to the document
+     instead of trapping it in an inner body scroller. */
+  html, body { height: auto; min-height: 100%; }
+  body { font-size: 16px; }
+  .wrap { max-width: 78rem; margin: 0 auto; padding: 1.5rem 1.5rem 6rem; }
+
+  /* ---- chrome ---- */
+  .topbar {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+    padding: 1rem 1.5rem;
+    background: rgba(13, 17, 23, 0.92);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar__title { margin: 0; font-size: 1.125rem; font-weight: 700; letter-spacing: -0.01em; }
+  .topbar__spacer { flex: 1; }
+
+  .tabs { display: flex; gap: 0.25rem; }
+  .tab {
+    min-height: 2.75rem; padding: 0 1rem;
+    border: 1px solid transparent; border-radius: 0.5rem;
+    background: transparent; color: var(--text-dim);
+    font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .tab[aria-selected="true"] { background: var(--bg-raised); border-color: var(--border); color: var(--text); }
+
+  .btn-sm {
+    min-height: 2.5rem; padding: 0 0.9rem;
+    font-size: 0.9375rem; border-radius: 0.5rem;
+  }
+
+  /* ---- controls row ---- */
+  .controls {
+    display: flex; align-items: flex-end; gap: 0.75rem; flex-wrap: wrap;
+    margin: 1.5rem 0 1rem;
+  }
+  .control { display: flex; flex-direction: column; gap: 0.35rem; }
+  .control__label { font-size: 0.8125rem; font-weight: 600; color: var(--text-dim); }
+  .input {
+    min-height: 2.75rem; padding: 0 0.75rem;
+    border: 1px solid var(--border); border-radius: 0.5rem;
+    background: var(--bg-raised); color: var(--text);
+    font: inherit;
+  }
+  .input:focus { outline: 2px solid var(--out-bright); outline-offset: -1px; border-color: transparent; }
+  .input--search { min-width: 18rem; }
+  .presets { display: flex; gap: 0.25rem; }
+
+  /* ---- tables ---- */
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 0.75rem; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 0.75rem 1rem; text-align: left; white-space: nowrap; }
+  thead th {
+    position: sticky; top: 0;
+    background: var(--bg-raised);
+    font-size: 0.8125rem; font-weight: 600; color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }
+  thead th.sortable { cursor: pointer; user-select: none; }
+  thead th.sortable:hover { color: var(--text); }
+  th.num, td.num { text-align: right; }
+  tbody tr { border-top: 1px solid var(--border); }
+  tbody tr:hover { background: rgba(255, 255, 255, 0.03); }
+  tbody tr.clickable { cursor: pointer; }
+  tfoot td { border-top: 2px solid var(--border); font-weight: 700; background: var(--bg-raised); }
+  .name-cell { font-weight: 600; }
+  .muted { color: var(--text-dim); }
+
+  /* ---- status pills. Colour never carries meaning alone: each pill has a word. ---- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 0.4em;
+    padding: 0.2em 0.6em; border-radius: 999px;
+    font-size: 0.8125rem; font-weight: 600; white-space: nowrap;
+  }
+  .pill--in     { background: rgba(63, 185, 80, 0.16);  color: var(--in-bright); }
+  .pill--review { background: rgba(210, 153, 34, 0.16); color: var(--warn-bright); }
+  .pill--error  { background: rgba(248, 81, 73, 0.16);  color: var(--error-bright); }
+  .pill--quiet  { background: var(--bg-raised); color: var(--text-dim); }
+
+  .live-dot {
+    width: 0.55em; height: 0.55em; border-radius: 50%;
+    background: var(--in-bright);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  /* ---- stat tiles ---- */
+  .tiles {
+    display: grid; gap: 0.75rem;
+    grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+    margin: 1.25rem 0;
+  }
+  .tile { padding: 1rem; border: 1px solid var(--border); border-radius: 0.75rem; background: var(--bg-raised); }
+  .tile__label { font-size: 0.8125rem; font-weight: 600; color: var(--text-dim); }
+  .tile__value { margin-top: 0.35rem; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }
+  .tile__value small { font-size: 0.9rem; font-weight: 600; color: var(--text-dim); }
+
+  /* ---- bar chart: one series, so no legend; the heading names it ---- */
+  .chart-card { padding: 1.25rem; border: 1px solid var(--border); border-radius: 0.75rem; background: var(--bg-raised); }
+  .chart-card h3 { margin: 0 0 0.25rem; font-size: 1rem; }
+  .chart-card p.muted { margin: 0 0 1rem; font-size: 0.875rem; }
+  .chart { position: relative; }
+  .chart__plot {
+    position: relative;
+    display: flex; align-items: flex-end; gap: 2px;   /* 2px surface gap between bars */
+    height: 200px;
+    padding-left: 3rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .chart__grid { position: absolute; inset: 0 0 0 3rem; pointer-events: none; }
+  .chart__gridline { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--border); opacity: 0.55; }
+  .chart__gridlabel {
+    position: absolute; right: calc(100% + 0.5rem); transform: translateY(-50%);
+    font-size: 0.75rem; color: var(--text-dim); font-variant-numeric: tabular-nums;
+  }
+  .chart__col {
+    position: relative; flex: 1 1 0; min-width: 6px; height: 100%;
+    display: flex; align-items: flex-end; justify-content: center;
+  }
+  .chart__bar {
+    /* Capped and centred: with only a handful of weeks, full-width bars butt up
+       against each other and a run of them reads as one solid block. */
+    width: 100%; max-width: 2.75rem;
+    background: var(--chart-bar);
+    border-radius: 4px 4px 0 0;      /* rounded data-end, anchored to the baseline */
+    transition: filter 120ms;
+  }
+  .chart__col:hover .chart__bar { filter: brightness(1.25); }
+  .chart__bar--empty { background: var(--border); min-height: 2px; border-radius: 0; }
+  .chart__peak {
+    position: absolute; bottom: calc(var(--h) + 6px); left: 50%; transform: translateX(-50%);
+    font-size: 0.75rem; font-weight: 700; white-space: nowrap; color: var(--text);
+  }
+  .chart__axis { display: flex; gap: 2px; padding-left: 3rem; margin-top: 0.4rem; }
+  .chart__tick {
+    flex: 1 1 0; min-width: 6px; text-align: center;
+    font-size: 0.6875rem; color: var(--text-dim); white-space: nowrap; overflow: hidden;
+  }
+  .chart__tip {
+    position: absolute; z-index: 3; pointer-events: none;
+    padding: 0.5rem 0.7rem; border: 1px solid var(--border); border-radius: 0.5rem;
+    background: var(--bg); font-size: 0.8125rem; line-height: 1.4;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); white-space: nowrap;
+  }
+  .chart__tip strong { display: block; }
+
+  /* ---- session list ---- */
+  .session {
+    display: grid; align-items: center; gap: 0.75rem;
+    grid-template-columns: 8.5rem 1fr auto auto;
+    padding: 0.75rem 1rem;
+    border-top: 1px solid var(--border);
+  }
+  .session:first-child { border-top: 0; }
+  .session--problem { background: rgba(210, 153, 34, 0.07); }
+  .session__date { font-weight: 600; }
+  .session__times { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .session__dur { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .session__actions { display: flex; gap: 0.4rem; }
+  .session__editor {
+    grid-column: 1 / -1;
+    display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end;
+    padding: 0.9rem; margin-top: 0.5rem;
+    border: 1px solid var(--border); border-radius: 0.5rem; background: var(--bg);
+  }
+  .confirm__actions { margin-left: auto; display: flex; gap: 0.5rem; flex-shrink: 0; }
+  .confirm {
+    grid-column: 1 / -1;
+    display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+    padding: 0.75rem 0.9rem; margin-top: 0.5rem;
+    border: 1px solid var(--error); border-radius: 0.5rem;
+    background: rgba(164, 35, 47, 0.12);
+  }
+  .btn-danger { background: var(--error); border-color: var(--error-bright); }
+
+  /* ---- misc ---- */
+  .card { border: 1px solid var(--border); border-radius: 0.75rem; background: var(--bg-raised); }
+  .banner {
+    display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+    padding: 0.9rem 1.1rem; margin-bottom: 1rem;
+    border: 1px solid var(--error); border-radius: 0.5rem;
+    background: rgba(164, 35, 47, 0.12);
+  }
+  .empty { padding: 3rem 1rem; text-align: center; color: var(--text-dim); }
+  .gate { min-height: 100vh; display: grid; place-items: center; padding: 1.5rem; }
+  .gate__card { width: min(26rem, 100%); display: flex; flex-direction: column; gap: 1rem; padding: 2rem; }
+  .gate h1 { margin: 0; font-size: 1.35rem; }
+  .back {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    background: none; border: 0; padding: 0.5rem 0;
+    color: var(--out-bright); font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .detail-head { display: flex; align-items: flex-start; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+  .detail-head h2 { margin: 0; font-size: 1.5rem; }
+  .row-gap { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .add-form { display: flex; gap: 0.75rem; align-items: flex-end; flex-wrap: wrap; padding: 1rem; margin-bottom: 1rem; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+
+<body data-palette="#388bfd">
+
+<!-- PIN gate ------------------------------------------------------------- -->
+<div class="gate" id="gate">
+  <div class="card gate__card">
+    <h1>Lab Hours</h1>
+    <p class="muted" style="margin:0">Enter the admin PIN. It is checked against the Config tab of the sheet.</p>
+    <label class="visually-hidden" for="pin">Admin PIN</label>
+    <input class="input" id="pin" type="password" inputmode="numeric" placeholder="PIN"
+           autocomplete="off" enterkeyhint="go">
+    <p class="muted" id="gate-msg" style="margin:0;min-height:1.4em"></p>
+    <button class="btn btn--primary" id="unlock" type="button">Unlock</button>
+  </div>
+</div>
+
+<!-- App ------------------------------------------------------------------ -->
+<div id="app" hidden>
+  <header class="topbar">
+    <h1 class="topbar__title">Lab Hours</h1>
+    <div class="tabs" role="tablist">
+      <button class="tab" id="tab-roster" role="tab" aria-selected="true">Roster</button>
+      <button class="tab" id="tab-timesheet" role="tab" aria-selected="false">Timesheet</button>
+    </div>
+    <span class="topbar__spacer"></span>
+    <span class="muted" id="freshness" style="font-size:0.875rem"></span>
+    <button class="btn btn--ghost btn-sm" id="refresh" type="button">Refresh</button>
+    <button class="btn btn--ghost btn-sm" id="lock" type="button">Lock</button>
+  </header>
+
+  <main class="wrap">
+    <div class="banner" id="banner" hidden>
+      <span id="banner-msg"></span>
+      <button class="btn btn--ghost btn-sm" id="banner-retry" type="button">Retry</button>
+    </div>
+    <div id="view"></div>
+  </main>
+</div>
+
+<script type="module">
+import * as api from './js/api.js';
+import { ApiError } from './js/api.js';
+
+// ---------------------------------------------------------------------------
+// State
+//
+// Everything on this page is derived from two fetches made once at unlock:
+// the roster (so students with no events still appear, and so we know who is
+// archived) and the FULL timesheet with no date range. Filtering, totals,
+// averages, weekly buckets and the chart are all computed here from that one
+// session list. Nothing is stored back to the Sheet, and no view triggers a
+// per-student request.
+// ---------------------------------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  pin: sessionStorage.getItem('lab.admin.pin') || '',
+  students: [],
+  sessions: [],
+  byStudent: new Map(),
+  loadedAt: null,
+  view: 'roster',          // 'roster' | 'timesheet' | 'detail'
+  detailId: null,
+  search: '',
+  from: '',
+  to: '',
+  showInactive: false,
+  sort: { key: 'name', dir: 1 },
+  editing: null,           // session key being edited
+  confirming: null,        // session key awaiting delete confirmation
+  adding: false,
+  busy: false,
+};
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function fmtHours(minutes) {
+  if (minutes == null) return '—';
+  return (Math.round(minutes / 6) / 10).toFixed(1);
+}
+
+function fmtDur(minutes) {
+  if (minutes == null) return '—';
+  if (minutes < 60) return minutes + 'm';
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m ? h + 'h ' + m + 'm' : h + 'h';
+}
+
+function fmtDate(iso) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+}
+
+function fmtWhen(iso) {
+  if (!iso) return '—';
+  return fmtDate(iso) + ', ' + fmtTime(iso);
+}
+
+/** YYYY-MM-DD of the Monday that starts the week containing d. */
+function weekStart(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+  return x;
+}
+
+function dateKey(d) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+function toLocalInput(iso) {
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+         'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+// A session's identity for UI bookkeeping. Event ids change whenever a
+// correction supersedes one, so this is only ever used within a single render.
+const sessionKey = (s) => (s.in_event_id || '') + '|' + (s.out_event_id || '');
+
+// ---------------------------------------------------------------------------
+// Stats — all computed from the session list, never read from the Sheet
+// ---------------------------------------------------------------------------
+
+/**
+ * A session counts toward totals only when it is well formed. The backend marks
+ * anything else — an IN with no OUT, an OUT with no IN, an inverted pair — with
+ * needs_review and a null duration, and those rows are reported separately
+ * rather than folded into an average that would quietly be wrong.
+ */
+function statsFor(sessions) {
+  const closed = sessions.filter((s) => s.status === 'closed' && typeof s.minutes === 'number');
+  const totalMinutes = closed.reduce((sum, s) => sum + s.minutes, 0);
+
+  let longest = null, shortest = null;
+  for (const s of closed) {
+    if (longest === null || s.minutes > longest) longest = s.minutes;
+    if (shortest === null || s.minutes < shortest) shortest = s.minutes;
+  }
+
+  const stamps = sessions.map((s) => s.out_time || s.in_time).filter(Boolean).sort();
+
+  return {
+    totalMinutes,
+    count: closed.length,
+    average: closed.length ? Math.round(totalMinutes / closed.length) : null,
+    longest,
+    shortest,
+    perWeek: sessionsPerWeek(closed),
+    problems: sessions.filter((s) => s.needs_review).length,
+    flagged: sessions.filter((s) => s.flagged).length,
+    open: sessions.find((s) => s.status === 'open') || null,
+    lastSeen: stamps.length ? stamps[stamps.length - 1] : null,
+  };
+}
+
+function sessionsPerWeek(closed) {
+  if (!closed.length) return null;
+  const times = closed.map((s) => new Date(s.in_time).getTime());
+  const spanDays = (Math.max(...times) - Math.min(...times)) / 86400000 + 1;
+  return Math.round((closed.length / Math.max(1, spanDays / 7)) * 10) / 10;
+}
+
+/** Minutes a still-open session has run, computed live in the browser. */
+function openMinutes(session) {
+  return Math.max(0, Math.round((Date.now() - new Date(session.in_time).getTime()) / 60000));
+}
+
+/** Hours per week, with empty weeks kept so the time axis stays continuous. */
+function weeklyHours(sessions) {
+  const closed = sessions.filter((s) => s.status === 'closed' && typeof s.minutes === 'number');
+  if (!closed.length) return [];
+
+  const buckets = new Map();
+  for (const s of closed) {
+    const key = dateKey(weekStart(new Date(s.in_time)));
+    const bucket = buckets.get(key) || { minutes: 0, sessions: 0 };
+    bucket.minutes += s.minutes;
+    bucket.sessions += 1;
+    buckets.set(key, bucket);
+  }
+
+  const keys = [...buckets.keys()].sort();
+  const out = [];
+  const cursor = new Date(keys[0] + 'T00:00:00');
+  const last = new Date(keys[keys.length - 1] + 'T00:00:00');
+  while (cursor <= last) {
+    const key = dateKey(cursor);
+    const bucket = buckets.get(key) || { minutes: 0, sessions: 0 };
+    out.push({
+      key,
+      label: cursor.toLocaleDateString([], { month: 'short', day: 'numeric' }),
+      hours: bucket.minutes / 60,
+      minutes: bucket.minutes,
+      sessions: bucket.sessions,
+    });
+    cursor.setDate(cursor.getDate() + 7);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Selectors
+// ---------------------------------------------------------------------------
+
+/** Sessions inside the chosen date range. Range is inclusive, local days. */
+function inRange(sessions) {
+  return sessions.filter((s) => {
+    if (state.from && s.date < state.from) return false;
+    if (state.to && s.date > state.to) return false;
+    return true;
+  });
+}
+
+function sessionsOf(studentId) {
+  return state.byStudent.get(studentId) || [];
+}
+
+function rangeLabel() {
+  if (!state.from && !state.to) return 'All time';
+  if (state.from && state.to) return fmtDate(state.from + 'T12:00') + ' – ' + fmtDate(state.to + 'T12:00');
+  if (state.from) return 'Since ' + fmtDate(state.from + 'T12:00');
+  return 'Up to ' + fmtDate(state.to + 'T12:00');
+}
+
+// ---------------------------------------------------------------------------
+// Loading
+// ---------------------------------------------------------------------------
+
+async function load() {
+  // Two calls, once. The roster carries students with no events at all (and the
+  // active flag); the timesheet is fetched with NO date range so every view can
+  // filter locally without going back to the network.
+  const [roster, timesheet] = await Promise.all([
+    api.admin.getRoster(state.pin, { timeoutMs: 30000 }),
+    api.admin.getTimesheet(state.pin, {}, { timeoutMs: 60000 }),
+  ]);
+
+  state.students = roster.students.slice().sort((a, b) => a.name.localeCompare(b.name));
+  state.sessions = timesheet.sessions;
+  state.byStudent = new Map();
+  for (const s of state.sessions) {
+    if (!state.byStudent.has(s.student_id)) state.byStudent.set(s.student_id, []);
+    state.byStudent.get(s.student_id).push(s);
+  }
+  // Oldest first, so session lists and weekly buckets read chronologically.
+  for (const list of state.byStudent.values()) {
+    list.sort((a, b) => String(a.in_time || a.out_time).localeCompare(String(b.in_time || b.out_time)));
+  }
+  state.loadedAt = new Date();
+}
+
+function showBanner(message) {
+  $('banner-msg').textContent = message;
+  $('banner').hidden = false;
+}
+
+async function refresh() {
+  if (state.busy) return;
+  state.busy = true;
+  $('refresh').disabled = true;
+  try {
+    await load();
+    $('banner').hidden = true;
+  } catch (err) {
+    showBanner(err.message);
+  } finally {
+    state.busy = false;
+    $('refresh').disabled = false;
+    render();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function render() {
+  // Preserve the caret: the search box re-renders the table on every keystroke.
+  const active = document.activeElement;
+  const focusId = active && active.id ? active.id : null;
+  const caret = active && typeof active.selectionStart === 'number' ? active.selectionStart : null;
+
+  $('freshness').textContent = state.loadedAt
+    ? 'Updated ' + state.loadedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : '';
+  $('tab-roster').setAttribute('aria-selected', String(state.view === 'roster'));
+  $('tab-timesheet').setAttribute('aria-selected', String(state.view === 'timesheet'));
+
+  if (state.view === 'detail') $('view').innerHTML = detailHtml();
+  else if (state.view === 'timesheet') $('view').innerHTML = timesheetHtml();
+  else $('view').innerHTML = rosterHtml();
+
+  if (focusId && $(focusId)) {
+    $(focusId).focus();
+    if (caret != null) { try { $(focusId).setSelectionRange(caret, caret); } catch { /* not a text field */ } }
+  }
+  if (state.view === 'detail') wireChart();
+  updateLive();
+}
+
+/** Update only the live counters, so typing is never interrupted by the timer. */
+function updateLive() {
+  for (const el of document.querySelectorAll('[data-since]')) {
+    el.textContent = fmtDur(Math.max(0,
+      Math.round((Date.now() - new Date(el.dataset.since).getTime()) / 60000)));
+  }
+}
+
+function livePill(open) {
+  if (!open) return '';
+  return '<span class="pill pill--in"><span class="live-dot"></span> In now · ' +
+         '<span data-since="' + esc(open.in_time) + '">' + fmtDur(openMinutes(open)) + '</span></span>';
+}
+
+// ---- Roster ---------------------------------------------------------------
+
+function rosterHtml() {
+  const term = state.search.trim().toLowerCase();
+  const rows = state.students.filter((s) => {
+    if (!state.showInactive && !s.active) return false;
+    if (!term) return true;
+    return s.name.toLowerCase().includes(term) || s.student_id.includes(term);
+  });
+
+  const body = rows.map((student) => {
+    // "In the lab now" is a fact about right now, so it always looks at the
+    // whole log — never at whatever date range the timesheet happens to have.
+    const all = sessionsOf(student.student_id);
+    const st = statsFor(all);
+    return `
+      <tr class="clickable" data-action="open" data-id="${esc(student.student_id)}">
+        <td class="name-cell">${esc(student.name)}
+          ${student.active ? '' : ' <span class="pill pill--quiet">Archived</span>'}
+          ${livePill(st.open)}</td>
+        <td class="muted">${esc(student.grade || '—')}</td>
+        <td class="num">${fmtHours(st.totalMinutes)}</td>
+        <td class="num">${st.count}</td>
+        <td class="muted">${fmtWhen(st.lastSeen)}</td>
+        <td>${st.problems ? '<span class="pill pill--review">⚠ ' + st.problems + ' to review</span>' : ''}</td>
+        <td><button class="btn btn--ghost btn-sm" data-action="toggle-active"
+                    data-id="${esc(student.student_id)}" data-active="${student.active}"
+            >${student.active ? 'Archive' : 'Restore'}</button></td>
+      </tr>`;
+  }).join('');
+
+  const inLab = state.students.filter((s) => s.active && statsFor(sessionsOf(s.student_id)).open).length;
+
+  return `
+    <div class="controls">
+      <div class="control">
+        <label class="control__label" for="search">Search</label>
+        <input class="input input--search" id="search" type="search" placeholder="Name or ID"
+               value="${esc(state.search)}" autocomplete="off">
+      </div>
+      <div class="control">
+        <label class="control__label" for="show-inactive">&nbsp;</label>
+        <label class="row-gap" style="min-height:2.75rem">
+          <input type="checkbox" id="show-inactive" ${state.showInactive ? 'checked' : ''}>
+          <span>Show archived</span>
+        </label>
+      </div>
+      <span class="topbar__spacer"></span>
+      <button class="btn btn--primary btn-sm" data-action="show-add" type="button">Add student</button>
+    </div>
+
+    ${state.adding ? addFormHtml() : ''}
+
+    <p class="muted" style="margin:0 0 0.75rem">
+      ${rows.length} student${rows.length === 1 ? '' : 's'} shown ·
+      <strong>${inLab}</strong> in the lab now
+    </p>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr>
+          <th>Name</th><th>Grade</th><th class="num">Hours</th><th class="num">Sessions</th>
+          <th>Last seen</th><th>Review</th><th></th>
+        </tr></thead>
+        <tbody>${body || '<tr><td colspan="7" class="empty">No students match.</td></tr>'}</tbody>
+      </table>
+    </div>`;
+}
+
+function addFormHtml() {
+  return `
+    <div class="card add-form">
+      <div class="control">
+        <label class="control__label" for="add-id">Student ID (7 digits)</label>
+        <input class="input" id="add-id" inputmode="numeric" maxlength="7" placeholder="1234567" autocomplete="off">
+      </div>
+      <div class="control">
+        <label class="control__label" for="add-name">Full name</label>
+        <input class="input" id="add-name" placeholder="Full name" autocomplete="off">
+      </div>
+      <div class="control">
+        <label class="control__label" for="add-grade">Grade</label>
+        <input class="input" id="add-grade" style="width:6rem" placeholder="11" autocomplete="off">
+      </div>
+      <button class="btn btn--primary btn-sm" data-action="add-save" type="button">Add</button>
+      <button class="btn btn--ghost btn-sm" data-action="add-cancel" type="button">Cancel</button>
+      <span class="muted" id="add-msg"></span>
+    </div>`;
+}
+
+// ---- Timesheet ------------------------------------------------------------
+
+function timesheetRows() {
+  const term = state.search.trim().toLowerCase();
+  const rows = [];
+  for (const student of state.students) {
+    if (!state.showInactive && !student.active) continue;
+    if (term && !student.name.toLowerCase().includes(term) && !student.student_id.includes(term)) continue;
+    const st = statsFor(inRange(sessionsOf(student.student_id)));
+    rows.push({ student, st });
+  }
+
+  const { key, dir } = state.sort;
+  const value = (r) => ({
+    name: r.student.name.toLowerCase(),
+    grade: r.student.grade || '',
+    hours: r.st.totalMinutes,
+    sessions: r.st.count,
+    average: r.st.average ?? -1,
+    last: r.st.lastSeen || '',
+    review: r.st.problems,
+  }[key]);
+
+  return rows.sort((a, b) => {
+    const av = value(a), bv = value(b);
+    if (av < bv) return -dir;
+    if (av > bv) return dir;
+    return a.student.name.localeCompare(b.student.name);
+  });
+}
+
+function sortArrow(key) {
+  if (state.sort.key !== key) return '';
+  return state.sort.dir === 1 ? ' ↑' : ' ↓';
+}
+
+function timesheetHtml() {
+  const rows = timesheetRows();
+  const totalMinutes = rows.reduce((sum, r) => sum + r.st.totalMinutes, 0);
+  const totalSessions = rows.reduce((sum, r) => sum + r.st.count, 0);
+  const totalReview = rows.reduce((sum, r) => sum + r.st.problems, 0);
+
+  const body = rows.map(({ student, st }) => `
+    <tr class="clickable" data-action="open" data-id="${esc(student.student_id)}">
+      <td class="name-cell">${esc(student.name)}${student.active ? '' : ' <span class="pill pill--quiet">Archived</span>'}${livePill(st.open)}</td>
+      <td class="muted">${esc(student.grade || '—')}</td>
+      <td class="num">${fmtHours(st.totalMinutes)}</td>
+      <td class="num">${st.count}</td>
+      <td class="num">${st.average == null ? '—' : fmtDur(st.average)}</td>
+      <td class="muted">${fmtWhen(st.lastSeen)}</td>
+      <td class="num">${st.problems ? '<span class="pill pill--review">⚠ ' + st.problems + '</span>' : '<span class="muted">0</span>'}</td>
+    </tr>`).join('');
+
+  return `
+    <div class="controls">
+      <div class="control">
+        <label class="control__label" for="from">From</label>
+        <input class="input" id="from" type="date" value="${esc(state.from)}">
+      </div>
+      <div class="control">
+        <label class="control__label" for="to">To</label>
+        <input class="input" id="to" type="date" value="${esc(state.to)}">
+      </div>
+      <div class="control">
+        <span class="control__label">Quick range</span>
+        <div class="presets">
+          <button class="btn btn--ghost btn-sm" data-action="preset" data-preset="all">All time</button>
+          <button class="btn btn--ghost btn-sm" data-action="preset" data-preset="week">This week</button>
+          <button class="btn btn--ghost btn-sm" data-action="preset" data-preset="30">Last 30 days</button>
+          <button class="btn btn--ghost btn-sm" data-action="preset" data-preset="season">This season</button>
+        </div>
+      </div>
+      <div class="control">
+        <label class="control__label" for="search">Search</label>
+        <input class="input" id="search" type="search" placeholder="Name or ID" value="${esc(state.search)}" autocomplete="off">
+      </div>
+      <span class="topbar__spacer"></span>
+      <button class="btn btn--primary btn-sm" data-action="export" type="button">Export CSV</button>
+    </div>
+
+    <p class="muted" style="margin:0 0 0.75rem">${esc(rangeLabel())} · ${rows.length} students</p>
+
+    <div class="table-scroll">
+      <table>
+        <thead><tr>
+          <th class="sortable" data-action="sort" data-key="name">Name${sortArrow('name')}</th>
+          <th class="sortable" data-action="sort" data-key="grade">Grade${sortArrow('grade')}</th>
+          <th class="sortable num" data-action="sort" data-key="hours">Total hours${sortArrow('hours')}</th>
+          <th class="sortable num" data-action="sort" data-key="sessions">Sessions${sortArrow('sessions')}</th>
+          <th class="sortable num" data-action="sort" data-key="average">Avg session${sortArrow('average')}</th>
+          <th class="sortable" data-action="sort" data-key="last">Last seen${sortArrow('last')}</th>
+          <th class="sortable num" data-action="sort" data-key="review">Review${sortArrow('review')}</th>
+        </tr></thead>
+        <tbody>${body || '<tr><td colspan="7" class="empty">No sessions in this range.</td></tr>'}</tbody>
+        <tfoot><tr>
+          <td>Team total</td><td></td>
+          <td class="num">${fmtHours(totalMinutes)}</td>
+          <td class="num">${totalSessions}</td>
+          <td class="num">${totalSessions ? fmtDur(Math.round(totalMinutes / totalSessions)) : '—'}</td>
+          <td></td>
+          <td class="num">${totalReview || ''}</td>
+        </tr></tfoot>
+      </table>
+    </div>`;
+}
+
+// ---- Student detail -------------------------------------------------------
+
+function detailHtml() {
+  const student = state.students.find((s) => s.student_id === state.detailId);
+  if (!student) return '<div class="empty">Student not found. <button class="back" data-action="back">← Back</button></div>';
+
+  const sessions = sessionsOf(student.student_id);
+  const st = statsFor(sessions);
+  const weeks = weeklyHours(sessions);
+  const newestFirst = sessions.slice().reverse();
+
+  return `
+    <button class="back" data-action="back">← All students</button>
+
+    <div class="detail-head">
+      <div>
+        <h2>${esc(student.name)} ${livePill(st.open)}</h2>
+        <p class="muted" style="margin:0.25rem 0 0">
+          ID ${esc(student.student_id)}${student.grade ? ' · Grade ' + esc(student.grade) : ''}
+          ${student.active ? '' : ' · <span class="pill pill--quiet">Archived</span>'}
+        </p>
+      </div>
+      <span class="topbar__spacer"></span>
+      <button class="btn btn--ghost btn-sm" data-action="toggle-active"
+              data-id="${esc(student.student_id)}" data-active="${student.active}"
+        >${student.active ? 'Archive' : 'Restore'}</button>
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><div class="tile__label">Total time</div>
+        <div class="tile__value">${fmtHours(st.totalMinutes)} <small>h</small></div></div>
+      <div class="tile"><div class="tile__label">Sessions</div>
+        <div class="tile__value">${st.count}</div></div>
+      <div class="tile"><div class="tile__label">Average session</div>
+        <div class="tile__value">${st.average == null ? '—' : fmtDur(st.average)}</div></div>
+      <div class="tile"><div class="tile__label">Longest</div>
+        <div class="tile__value">${fmtDur(st.longest)}</div></div>
+      <div class="tile"><div class="tile__label">Shortest</div>
+        <div class="tile__value">${fmtDur(st.shortest)}</div></div>
+      <div class="tile"><div class="tile__label">Sessions per week</div>
+        <div class="tile__value">${st.perWeek == null ? '—' : st.perWeek}</div></div>
+    </div>
+
+    ${st.problems ? `<div class="banner" style="border-color:var(--warn);background:rgba(210,153,34,0.12)">
+        <span>⚠ ${st.problems} session${st.problems === 1 ? '' : 's'} need review — marked below.</span>
+      </div>` : ''}
+
+    <div class="chart-card" style="margin-bottom:1.25rem">
+      <h3>Hours per week</h3>
+      <p class="muted">Completed sessions only. Weeks with no lab time are shown empty.</p>
+      ${chartHtml(weeks)}
+    </div>
+
+    <div class="card">
+      <div style="padding:0.9rem 1rem;border-bottom:1px solid var(--border)">
+        <strong>${sessions.length} session${sessions.length === 1 ? '' : 's'}</strong>
+        <span class="muted">· newest first</span>
+      </div>
+      ${newestFirst.map(sessionRowHtml).join('') || '<div class="empty">No sessions recorded.</div>'}
+    </div>`;
+}
+
+/** Round an axis maximum up to a readable tick. */
+function niceMax(value) {
+  if (!(value > 0)) return 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(value)));
+  for (const step of [1, 2, 2.5, 5, 10]) {
+    if (value <= step * pow) return step * pow;
+  }
+  return 10 * pow;
+}
+
+/**
+ * One series, so there is no legend — the heading names it — and only the peak
+ * week is labelled directly rather than putting a number on every bar. Bars are
+ * anchored to a zero baseline; a bar chart with a clipped axis lies about ratios.
+ */
+function chartHtml(weeks) {
+  if (!weeks.length) return '<p class="empty">No completed sessions yet.</p>';
+
+  const max = niceMax(Math.max(...weeks.map((w) => w.hours)));
+  const peak = weeks.reduce((best, w) => (w.hours > best.hours ? w : best), weeks[0]);
+  // Thin out x labels so they cannot collide at 30+ weeks.
+  const every = Math.ceil(weeks.length / 12);
+
+  const bars = weeks.map((w) => {
+    const pct = (w.hours / max) * 100;
+    const isPeak = w.key === peak.key && w.hours > 0;
+    return `<div class="chart__col" data-week="${esc(w.label)}" data-hours="${w.hours.toFixed(1)}"
+                 data-sessions="${w.sessions}" style="--h:${pct.toFixed(1)}%">
+      ${isPeak ? `<span class="chart__peak">${w.hours.toFixed(1)}h</span>` : ''}
+      <div class="chart__bar${w.hours ? '' : ' chart__bar--empty'}" style="height:${pct.toFixed(1)}%"></div>
+    </div>`;
+  }).join('');
+
+  const ticks = weeks.map((w, i) =>
+    `<div class="chart__tick">${i % every === 0 ? esc(w.label) : ''}</div>`).join('');
+
+  const grid = [0, 0.5, 1].map((f) => `
+    <div class="chart__gridline" style="top:${(100 - f * 100).toFixed(1)}%">
+      <span class="chart__gridlabel">${(max * f).toFixed(max < 4 ? 1 : 0)}h</span>
+    </div>`).join('');
+
+  return `
+    <div class="chart">
+      <div class="chart__plot" id="chart-plot">
+        <div class="chart__grid">${grid}</div>
+        ${bars}
+      </div>
+      <div class="chart__axis">${ticks}</div>
+      <div class="chart__tip" id="chart-tip" hidden></div>
+    </div>`;
+}
+
+/** Per-bar hover tooltip. Hit target is the whole column, not just the bar. */
+function wireChart() {
+  const plot = $('chart-plot');
+  const tip = $('chart-tip');
+  if (!plot || !tip) return;
+
+  plot.addEventListener('mousemove', (e) => {
+    const col = e.target.closest('.chart__col');
+    if (!col) { tip.hidden = true; return; }
+    tip.innerHTML = `<strong>Week of ${esc(col.dataset.week)}</strong>` +
+                    `${col.dataset.hours}h · ${col.dataset.sessions} session${col.dataset.sessions === '1' ? '' : 's'}`;
+    tip.hidden = false;
+    const bounds = plot.getBoundingClientRect();
+    const x = e.clientX - bounds.left;
+    tip.style.left = Math.min(Math.max(x + 12, 0), bounds.width - tip.offsetWidth) + 'px';
+    tip.style.top = Math.max(0, e.clientY - bounds.top - tip.offsetHeight - 12) + 'px';
+  });
+  plot.addEventListener('mouseleave', () => { tip.hidden = true; });
+}
+
+/** Labels for a session that is not a clean in/out pair. */
+const PROBLEM = {
+  unclosed: { pill: 'review', text: 'No check-out', why: 'They scanned in and never scanned out, so this time cannot be counted. Correct the check-in time, or delete the stray check-in.' },
+  orphan:   { pill: 'review', text: 'No check-in',  why: 'A check-out with nothing before it. Correct the check-out time, or delete the stray check-out.' },
+  reversed: { pill: 'error',  text: 'Times reversed', why: 'The check-out is earlier than the check-in, so this session has no usable duration.' },
+};
+
+function sessionRowHtml(s) {
+  const key = sessionKey(s);
+  const problem = PROBLEM[s.status];
+  const autoClosed = (s.sources || []).includes('auto-close');
+  const offline = (s.sources || []).includes('offline');
+
+  let duration;
+  if (s.status === 'closed') duration = fmtDur(s.minutes);
+  else if (s.status === 'open') duration = `<span data-since="${esc(s.in_time)}">${fmtDur(openMinutes(s))}</span>`;
+  else duration = '<span class="muted">—</span>';
+
+  const marks = [
+    s.status === 'open' ? '<span class="pill pill--in"><span class="live-dot"></span> In now</span>' : '',
+    problem ? `<span class="pill pill--${problem.pill}" title="${esc(problem.why)}">⚠ ${problem.text}</span>` : '',
+    autoClosed ? '<span class="pill pill--review">⏱ Auto-closed at lab close</span>' : '',
+    offline ? '<span class="pill pill--review">📴 Offline replay</span>' : '',
+    !autoClosed && !offline && s.flagged ? '<span class="pill pill--review">⚑ Unverified time</span>' : '',
+  ].filter(Boolean).join(' ');
+
+  return `
+    <div class="session${problem ? ' session--problem' : ''}">
+      <div class="session__date">${fmtDate(s.in_time || s.out_time)}</div>
+      <div class="session__times">
+        ${s.in_time ? fmtTime(s.in_time) : '<span class="muted">—</span>'}
+        →
+        ${s.out_time ? fmtTime(s.out_time) : (s.status === 'open' ? 'still here' : '<span class="muted">—</span>')}
+        ${marks ? '<div style="margin-top:0.35rem">' + marks + '</div>' : ''}
+      </div>
+      <div class="session__dur">${duration}</div>
+      <div class="session__actions">
+        <button class="btn btn--ghost btn-sm" data-action="edit" data-key="${esc(key)}">Edit</button>
+        <button class="btn btn--ghost btn-sm" data-action="ask-delete" data-key="${esc(key)}">Delete</button>
+      </div>
+      ${state.editing === key ? editorHtml(s) : ''}
+      ${state.confirming === key ? confirmHtml(s) : ''}
+    </div>`;
+}
+
+function editorHtml(s) {
+  return `
+    <div class="session__editor">
+      ${s.in_event_id ? `
+        <div class="control">
+          <label class="control__label" for="edit-in">Check-in</label>
+          <input class="input" id="edit-in" type="datetime-local" value="${esc(toLocalInput(s.in_time))}">
+        </div>` : '<p class="muted" style="margin:0">This session has no check-in event to edit.</p>'}
+      ${s.out_event_id ? `
+        <div class="control">
+          <label class="control__label" for="edit-out">Check-out</label>
+          <input class="input" id="edit-out" type="datetime-local" value="${esc(toLocalInput(s.out_time))}">
+        </div>` : ''}
+      <div class="control" style="flex:1;min-width:14rem">
+        <label class="control__label" for="edit-reason">Reason (saved in the log)</label>
+        <input class="input" id="edit-reason" placeholder="e.g. forgot to scan out" autocomplete="off">
+      </div>
+      <button class="btn btn--primary btn-sm" data-action="save-edit" data-key="${esc(sessionKey(s))}">Save</button>
+      <button class="btn btn--ghost btn-sm" data-action="cancel-edit">Cancel</button>
+      <p class="muted" style="flex-basis:100%;margin:0;font-size:0.8125rem">
+        Corrections are appended to the log, never written over the original. The corrected
+        time is hand-entered, so it will show as unverified.
+      </p>
+    </div>`;
+}
+
+function confirmHtml(s) {
+  const count = [s.in_event_id, s.out_event_id].filter(Boolean).length;
+  return `
+    <div class="confirm">
+      <strong>Delete this session?</strong>
+      <span class="muted">${count === 2 ? 'Both the check-in and check-out' : 'The one event'} will be voided.
+        The original rows stay in the sheet for audit, and the time stops counting.</span>
+      <div class="confirm__actions">
+        <button class="btn btn--ghost btn-sm" data-action="cancel-delete">Cancel</button>
+        <button class="btn btn-danger btn-sm" data-action="confirm-delete" data-key="${esc(sessionKey(s))}">Yes, delete</button>
+      </div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+function findSession(key) {
+  return state.sessions.find((s) => sessionKey(s) === key) || null;
+}
+
+async function withBusy(fn) {
+  if (state.busy) return;
+  state.busy = true;
+  try {
+    await fn();
+    $('banner').hidden = true;
+  } catch (err) {
+    showBanner(err instanceof ApiError ? err.message : String(err));
+  } finally {
+    state.busy = false;
+  }
+}
+
+/**
+ * Save a correction. Each changed end of the session is a separate append —
+ * editEvent supersedes one event id at a time — so a session with both ends
+ * moved costs two calls, and the second still targets a valid id because
+ * superseding the check-in does not touch the check-out.
+ */
+async function saveEdit(key) {
+  const session = findSession(key);
+  if (!session) return;
+  const reason = ($('edit-reason')?.value || '').trim();
+  const jobs = [];
+
+  const inEl = $('edit-in');
+  if (inEl && session.in_event_id && inEl.value) {
+    const next = new Date(inEl.value).toISOString();
+    if (Math.abs(new Date(next) - new Date(session.in_time)) >= 60000) {
+      jobs.push([session.in_event_id, next]);
+    }
+  }
+  const outEl = $('edit-out');
+  if (outEl && session.out_event_id && outEl.value) {
+    const next = new Date(outEl.value).toISOString();
+    if (Math.abs(new Date(next) - new Date(session.out_time)) >= 60000) {
+      jobs.push([session.out_event_id, next]);
+    }
+  }
+
+  if (!jobs.length) { state.editing = null; render(); return; }
+
+  await withBusy(async () => {
+    for (const [eventId, timestamp] of jobs) {
+      await api.admin.editEvent(state.pin, eventId, { timestamp, reason });
+    }
+    state.editing = null;
+    await load();
+  });
+  render();
+}
+
+async function deleteSession(key) {
+  const session = findSession(key);
+  if (!session) return;
+  const ids = [session.in_event_id, session.out_event_id].filter(Boolean);
+
+  await withBusy(async () => {
+    for (const id of ids) {
+      await api.admin.deleteEvent(state.pin, id, 'deleted from the admin page');
+    }
+    state.confirming = null;
+    await load();
+  });
+  render();
+}
+
+async function addStudent() {
+  const id = ($('add-id')?.value || '').trim();
+  const name = ($('add-name')?.value || '').trim();
+  const grade = ($('add-grade')?.value || '').trim();
+  const msg = $('add-msg');
+
+  if (!/^\d{7}$/.test(id)) { msg.textContent = 'The ID must be exactly 7 digits.'; return; }
+  if (name.length < 2) { msg.textContent = 'Enter a full name.'; return; }
+
+  msg.textContent = 'Saving…';
+  await withBusy(async () => {
+    await api.enroll(id, name, grade);
+    state.adding = false;
+    await load();
+  });
+  render();
+}
+
+async function toggleActive(studentId, currentlyActive) {
+  await withBusy(async () => {
+    await api.admin.setActive(state.pin, studentId, !currentlyActive);
+    await load();
+  });
+  render();
+}
+
+function applyPreset(preset) {
+  const today = new Date();
+  if (preset === 'all') { state.from = ''; state.to = ''; return; }
+  if (preset === 'week') {
+    state.from = dateKey(weekStart(today));
+    state.to = dateKey(today);
+    return;
+  }
+  if (preset === '30') {
+    const start = new Date(today);
+    start.setDate(start.getDate() - 29);
+    state.from = dateKey(start);
+    state.to = dateKey(today);
+    return;
+  }
+  if (preset === 'season') {
+    // A robotics season starts in the autumn; before August, use last year's.
+    const year = today.getMonth() >= 7 ? today.getFullYear() : today.getFullYear() - 1;
+    state.from = year + '-08-01';
+    state.to = dateKey(today);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CSV export — built in the browser, exactly the rows on screen
+// ---------------------------------------------------------------------------
+
+/**
+ * A leading =, +, - or @ makes a spreadsheet treat the cell as a formula when
+ * the file is reopened, so those values get a leading apostrophe.
+ */
+function csvCell(value) {
+  let text = value == null ? '' : String(value);
+  if (/^[=+\-@]/.test(text)) text = "'" + text;
+  return /[",\n\r]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+}
+
+function exportCsv() {
+  const rows = timesheetRows();
+  const header = ['student_id', 'name', 'grade', 'active', 'total_hours', 'total_minutes',
+                  'sessions', 'avg_session_minutes', 'longest_minutes', 'shortest_minutes',
+                  'sessions_per_week', 'last_seen', 'sessions_needing_review'];
+
+  const lines = [header.join(',')];
+  for (const { student, st } of rows) {
+    lines.push([
+      student.student_id, student.name, student.grade, student.active,
+      fmtHours(st.totalMinutes), st.totalMinutes, st.count,
+      st.average ?? '', st.longest ?? '', st.shortest ?? '', st.perWeek ?? '',
+      st.lastSeen ? new Date(st.lastSeen).toLocaleString() : '', st.problems,
+    ].map(csvCell).join(','));
+  }
+
+  const range = state.from || state.to ? (state.from || 'start') + '_to_' + (state.to || 'today') : 'all-time';
+  // ﻿ so Excel opens it as UTF-8 and does not mangle accented names.
+  const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'lab-hours_' + range + '.csv';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Event wiring
+// ---------------------------------------------------------------------------
+
+$('view').addEventListener('click', (event) => {
+  const el = event.target.closest('[data-action]');
+  if (!el) return;
+  const { action, id, key, active, preset } = el.dataset;
+
+  switch (action) {
+    case 'open':        state.view = 'detail'; state.detailId = id; state.editing = null;
+                        state.confirming = null; render(); window.scrollTo(0, 0); break;
+    case 'back':        state.view = 'roster'; state.detailId = null; render(); break;
+    case 'toggle-active': toggleActive(id, active === 'true'); break;
+    case 'show-add':    state.adding = true; render(); $('add-id')?.focus(); break;
+    case 'add-cancel':  state.adding = false; render(); break;
+    case 'add-save':    addStudent(); break;
+    case 'sort':        state.sort = state.sort.key === el.dataset.key
+                          ? { key: el.dataset.key, dir: -state.sort.dir }
+                          : { key: el.dataset.key, dir: el.dataset.key === 'name' ? 1 : -1 };
+                        render(); break;
+    case 'preset':      applyPreset(preset); render(); break;
+    case 'export':      exportCsv(); break;
+    case 'edit':        state.editing = state.editing === key ? null : key;
+                        state.confirming = null; render(); break;
+    case 'cancel-edit': state.editing = null; render(); break;
+    case 'save-edit':   saveEdit(key); break;
+    case 'ask-delete':  state.confirming = key; state.editing = null; render(); break;
+    case 'cancel-delete': state.confirming = null; render(); break;
+    case 'confirm-delete': deleteSession(key); break;
+  }
+});
+
+$('view').addEventListener('input', (event) => {
+  const el = event.target;
+  if (el.id === 'search') { state.search = el.value; render(); }
+  else if (el.id === 'from') { state.from = el.value; render(); }
+  else if (el.id === 'to') { state.to = el.value; render(); }
+  else if (el.id === 'show-inactive') { state.showInactive = el.checked; render(); }
+});
+
+$('tab-roster').addEventListener('click', () => {
+  state.view = 'roster'; state.detailId = null; render();
+});
+$('tab-timesheet').addEventListener('click', () => {
+  state.view = 'timesheet'; state.detailId = null; render();
+});
+$('refresh').addEventListener('click', refresh);
+$('banner-retry').addEventListener('click', refresh);
+$('lock').addEventListener('click', () => {
+  sessionStorage.removeItem('lab.admin.pin');
+  location.reload();
+});
+
+// ---------------------------------------------------------------------------
+// PIN gate
+//
+// The PIN is checked by making a real admin call: the backend compares it with
+// the Config tab and rejects anything else, so there is no separate "verify"
+// endpoint to keep in sync. It is held in sessionStorage, which dies with the
+// tab — a coach's laptop keeps it across a refresh but not across a restart.
+// ---------------------------------------------------------------------------
+
+async function unlock(pin) {
+  const msg = $('gate-msg');
+  msg.textContent = 'Checking…';
+  $('unlock').disabled = true;
+  state.pin = pin;
+  try {
+    await load();
+    sessionStorage.setItem('lab.admin.pin', pin);
+    $('gate').hidden = true;
+    $('app').hidden = false;
+    render();
+  } catch (err) {
+    state.pin = '';
+    sessionStorage.removeItem('lab.admin.pin');
+    msg.textContent = err instanceof ApiError ? err.message : String(err);
+    $('gate').hidden = false;
+    $('app').hidden = true;
+    $('pin').value = '';
+    $('pin').focus();
+  } finally {
+    $('unlock').disabled = false;
+  }
+}
+
+$('unlock').addEventListener('click', () => unlock($('pin').value.trim()));
+$('pin').addEventListener('keydown', (e) => { if (e.key === 'Enter') unlock($('pin').value.trim()); });
+
+// Live counters tick without re-rendering, so they never steal focus.
+setInterval(updateLive, 30000);
+
+if (state.pin) unlock(state.pin);
+else $('pin').focus();
+</script>
+</body>
+</html>
