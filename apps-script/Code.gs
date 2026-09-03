@@ -190,6 +190,7 @@ function doPost(e) {
       case 'editEvent':     return json_(actionEditEvent_(payload));
       case 'deleteEvent':   return json_(actionDeleteEvent_(payload));
       case 'setActive':     return json_(actionSetActive_(payload));
+      case 'setName':       return json_(actionSetName_(payload));
 
       default: fail_('unknown action: ' + action);
     }
@@ -1487,6 +1488,38 @@ function actionSetActive_(p) {
     // Column 4 is `active` — see HEADERS[Students]; column order is the contract.
     sheet_(TAB_STUDENTS).getRange(student._row, 4).setValue(active);
     return ok_({ student_id: studentId, name: student.name, active: active });
+  });
+}
+
+/**
+ * Correct a student's name. Like `active`, `name` is roster data, not
+ * attendance data — a misspelling at enrollment, a legal name change or a
+ * student who goes by something else is a fact about the person, not about a
+ * night in the lab. Nothing in Events stores a name (every row keys off
+ * student_id, and names are joined in on read), so a rename is invisible to
+ * every hour, session and statistic: the log is untouched and the totals come
+ * out identical.
+ *
+ * There is no history of the old name. If a coach needs one, the fix is a
+ * `note` on the Config tab, not a mutable column here.
+ */
+function actionSetName_(p) {
+  requirePin_(p);
+  var studentId = requireId_(p.student_id);
+  var name = requireStr_(p, 'name', 80);
+
+  return withLock_(function () {
+    var students = studentIndex_(readTable_(TAB_STUDENTS));
+    var student = students[studentId];
+    if (!student) fail_('no student with id ' + studentId);
+
+    var previous = student.name;
+    if (name !== previous) {
+      // Column 2 is `name` — see HEADERS[Students]; column order is the contract.
+      sheet_(TAB_STUDENTS).getRange(student._row, 2).setValue(name);
+    }
+    return ok_({ student_id: studentId, name: name, previous_name: previous,
+                 changed: name !== previous });
   });
 }
 

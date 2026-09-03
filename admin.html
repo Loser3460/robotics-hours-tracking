@@ -88,6 +88,12 @@
   tfoot td { border-top: 2px solid var(--border); font-weight: 700; background: var(--bg-raised); }
   .name-cell { font-weight: 600; }
   .muted { color: var(--text-dim); }
+  /* Rename and Archive sit side by side; keep them on one line per row.
+     This is a div inside the cell, never the <td> itself — a td with
+     display:flex stops being a table cell and the columns stop lining up. */
+  .row-actions { display: flex; gap: 0.4rem; align-items: center; white-space: nowrap; }
+  .name-cell #rename-input { min-width: 12rem; font-weight: 600; }
+  .detail-head h2 #rename-input { font-size: 1.25rem; min-width: 16rem; }
 
   /* ---- status pills. Colour never carries meaning alone: each pill has a word. ---- */
   .pill {
@@ -339,6 +345,7 @@ const state = {
   editing: null,           // session key being edited
   confirming: null,        // session key awaiting delete confirmation
   adding: false,
+  renaming: null,          // student_id whose name is being edited
   busy: false,
 };
 
@@ -710,19 +717,25 @@ function rosterHtml() {
     // whole log — never at whatever date range the timesheet happens to have.
     const all = sessionsOf(student.student_id);
     const st = statsFor(all);
+    // While the name is being edited the row must not be a link to the detail
+    // view — a click in the text field would navigate away mid-edit.
+    const renaming = state.renaming === student.student_id;
     return `
-      <tr class="clickable" data-action="open" data-id="${esc(student.student_id)}">
-        <td class="name-cell">${esc(student.name)}
+      <tr ${renaming ? '' : `class="clickable" data-action="open" data-id="${esc(student.student_id)}"`}>
+        <td class="name-cell">${renaming ? renameInputHtml(student) : `${esc(student.name)}
           ${student.active ? '' : ' <span class="pill pill--quiet">Archived</span>'}
-          ${livePill(st.open)}</td>
+          ${livePill(st.open)}`}</td>
         <td class="muted">${esc(student.grade || '—')}</td>
         <td class="num">${fmtHours(st.totalMinutes)}</td>
         <td class="num">${st.count}</td>
         <td class="muted">${fmtWhen(st.lastSeen)}</td>
         <td>${st.problems ? '<span class="pill pill--review">⚠ ' + st.problems + ' to review</span>' : ''}</td>
-        <td><button class="btn btn--ghost btn-sm" data-action="toggle-active"
-                    data-id="${esc(student.student_id)}" data-active="${student.active}"
-            >${student.active ? 'Archive' : 'Restore'}</button></td>
+        <td><div class="row-actions">${renaming ? renameButtonsHtml(student) : `
+          <button class="btn btn--ghost btn-sm" data-action="rename"
+                  data-id="${esc(student.student_id)}">Rename</button>
+          <button class="btn btn--ghost btn-sm" data-action="toggle-active"
+                  data-id="${esc(student.student_id)}" data-active="${student.active}"
+            >${student.active ? 'Archive' : 'Restore'}</button>`}</div></td>
       </tr>`;
   }).join('');
 
@@ -762,6 +775,25 @@ function rosterHtml() {
         <tbody>${body || '<tr><td colspan="7" class="empty">No students match.</td></tr>'}</tbody>
       </table>
     </div>`;
+}
+
+/**
+ * The name field, shown in place of the name in the roster row or the detail
+ * heading. The id is stable so render() can restore focus and caret position
+ * on the re-renders the live-counter timer causes while a coach is typing.
+ */
+function renameInputHtml(student) {
+  return `
+    <input class="input" id="rename-input" maxlength="80" autocomplete="off"
+           aria-label="Full name" value="${esc(student.name)}">
+    <span class="muted" id="rename-msg"></span>`;
+}
+
+function renameButtonsHtml(student) {
+  return `
+    <button class="btn btn--primary btn-sm" data-action="rename-save"
+            data-id="${esc(student.student_id)}" type="button">Save</button>
+    <button class="btn btn--ghost btn-sm" data-action="rename-cancel" type="button">Cancel</button>`;
 }
 
 function addFormHtml() {
@@ -945,22 +977,28 @@ function detailHtml() {
   const weeks = weeklyHours(sessions);
   const timeline = timelineFor(student.student_id);
   const summaryCount = summariesOf(student.student_id).length;
+  const renaming = state.renaming === student.student_id;
 
   return `
     <button class="back" data-action="back">← All students</button>
 
     <div class="detail-head">
       <div>
-        <h2>${esc(student.name)} ${livePill(st.open)}</h2>
+        ${renaming
+          ? `<h2>${renameInputHtml(student)}</h2>`
+          : `<h2>${esc(student.name)} ${livePill(st.open)}</h2>`}
         <p class="muted" style="margin:0.25rem 0 0">
           ID ${esc(student.student_id)}${student.grade ? ' · Grade ' + esc(student.grade) : ''}
           ${student.active ? '' : ' · <span class="pill pill--quiet">Archived</span>'}
         </p>
       </div>
       <span class="topbar__spacer"></span>
-      <button class="btn btn--ghost btn-sm" data-action="toggle-active"
-              data-id="${esc(student.student_id)}" data-active="${student.active}"
-        >${student.active ? 'Archive' : 'Restore'}</button>
+      <div class="row-actions">${renaming ? renameButtonsHtml(student) : `
+        <button class="btn btn--ghost btn-sm" data-action="rename"
+                data-id="${esc(student.student_id)}">Rename</button>
+        <button class="btn btn--ghost btn-sm" data-action="toggle-active"
+                data-id="${esc(student.student_id)}" data-active="${student.active}"
+          >${student.active ? 'Archive' : 'Restore'}</button>`}</div>
     </div>
 
     <div class="tiles">
@@ -1312,6 +1350,28 @@ async function addStudent() {
   render();
 }
 
+/**
+ * Fix a spelling, or record the name a student actually goes by. Only the
+ * roster row changes: Events keys off student_id alone, so every hour, session
+ * and summary already on file follows the student across the rename.
+ */
+async function saveRename(studentId) {
+  const student = state.students.find((s) => s.student_id === studentId);
+  const name = ($('rename-input')?.value || '').trim();
+  const msg = $('rename-msg');
+
+  if (name.length < 2) { if (msg) msg.textContent = 'Enter a full name.'; return; }
+  if (!student || name === student.name) { state.renaming = null; render(); return; }
+
+  if (msg) msg.textContent = 'Saving…';
+  await withBusy(async () => {
+    await api.admin.setName(state.pin, studentId, name);
+    state.renaming = null;
+    await load();
+  });
+  render();
+}
+
 async function toggleActive(studentId, currentlyActive) {
   await withBusy(async () => {
     await api.admin.setActive(state.pin, studentId, !currentlyActive);
@@ -1397,9 +1457,15 @@ $('view').addEventListener('click', (event) => {
 
   switch (action) {
     case 'open':        state.view = 'detail'; state.detailId = id; state.editing = null;
-                        state.confirming = null; render(); window.scrollTo(0, 0); break;
-    case 'back':        state.view = 'roster'; state.detailId = null; render(); break;
+                        state.confirming = null; state.renaming = null;
+                        render(); window.scrollTo(0, 0); break;
+    case 'back':        state.view = 'roster'; state.detailId = null; state.renaming = null;
+                        render(); break;
     case 'toggle-active': toggleActive(id, active === 'true'); break;
+    case 'rename':      state.renaming = id; state.editing = null; state.confirming = null;
+                        render(); $('rename-input')?.select(); break;
+    case 'rename-save': saveRename(id); break;
+    case 'rename-cancel': state.renaming = null; render(); break;
     case 'show-add':    state.adding = true; render(); $('add-id')?.focus(); break;
     case 'add-cancel':  state.adding = false; render(); break;
     case 'add-save':    addStudent(); break;
@@ -1422,6 +1488,12 @@ $('view').addEventListener('click', (event) => {
   }
 });
 
+$('view').addEventListener('keydown', (event) => {
+  if (event.target.id !== 'rename-input') return;
+  if (event.key === 'Enter') { event.preventDefault(); saveRename(state.renaming); }
+  else if (event.key === 'Escape') { state.renaming = null; render(); }
+});
+
 $('view').addEventListener('input', (event) => {
   const el = event.target;
   if (el.id === 'search') { state.search = el.value; render(); }
@@ -1431,13 +1503,13 @@ $('view').addEventListener('input', (event) => {
 });
 
 $('tab-roster').addEventListener('click', () => {
-  state.view = 'roster'; state.detailId = null; render();
+  state.view = 'roster'; state.detailId = null; state.renaming = null; render();
 });
 $('tab-timesheet').addEventListener('click', () => {
-  state.view = 'timesheet'; state.detailId = null; render();
+  state.view = 'timesheet'; state.detailId = null; state.renaming = null; render();
 });
 $('tab-flagged').addEventListener('click', () => {
-  state.view = 'flagged'; state.detailId = null; render();
+  state.view = 'flagged'; state.detailId = null; state.renaming = null; render();
 });
 $('refresh').addEventListener('click', refresh);
 $('banner-retry').addEventListener('click', refresh);

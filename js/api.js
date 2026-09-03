@@ -217,6 +217,13 @@ export const admin = {
     request('deleteEvent', { pin, event_id: eventId, reason }, options),
   setActive: (pin, studentId, active, options = {}) =>
     request('setActive', { pin, student_id: studentId, active }, options),
+  /**
+   * Correct a student's name. Name is roster data, not attendance data — the
+   * event log stores only student_id, so a rename changes no hour and no
+   * session. Resolves to {student_id, name, previous_name, changed}.
+   */
+  setName: (pin, studentId, name, options = {}) =>
+    request('setName', { pin, student_id: studentId, name }, options),
 };
 
 // --- health -----------------------------------------------------------------
