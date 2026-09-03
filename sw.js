@@ -28,9 +28,10 @@
 
 // Bump this on release to retire the old cache. Anything cached under a
 // previous version is deleted on activate.
-// v2: front-facing camera on the tablet. Bumping this forces every installed
-// tablet to refetch the shell instead of serving a cached scanner.js.
-const VERSION = 'v2';
+// v3: admin rename. api.js is served stale-while-revalidate, so without this
+// bump the new admin.html loads against the previously cached api.js and calls
+// an admin.setName that isn't there yet.
+const VERSION = 'v3';
 const CACHE = 'lab-shell-' + VERSION;
 
 /** Everything needed to boot the scanner with no network at all. */
