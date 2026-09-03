@@ -20,7 +20,6 @@
     /* The rear camera is not mirrored; do not transform it or the QR reads fine
        but the picture confuses anyone lining up their card. */
   }
-  #frame { display: none; }
 
   /* ---- aiming reticle ---- */
   .reticle {
@@ -132,7 +131,6 @@
   <!-- Camera -->
   <div id="stage">
     <video id="video" playsinline muted autoplay></video>
-    <canvas id="frame"></canvas>
   </div>
   <div class="reticle" aria-hidden="true"><span></span></div>
   <p class="prompt" id="prompt">Scan your card</p>
@@ -190,14 +188,13 @@
 
 <script type="module">
 import * as api from './js/api.js';
-import { ApiError, isValidStudentId } from './js/api.js';
+import { ApiError } from './js/api.js';
+import { createScanner, CameraError } from './js/scanner.js';
 
 // ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
 
-const DECODE_INTERVAL_MS = 120;    // how often we look for a QR code
-const REPEAT_LOCKOUT_MS  = 6000;   // ignore the same card re-entering the frame
 const HOLD_MS            = 4000;   // how long a confirmation stays up
 const BRIEF_MS           = 1800;   // for minor notices
 const SYNC_INTERVAL_MS   = 60000;  // background retry of the offline queue
@@ -205,16 +202,12 @@ const SYNC_INTERVAL_MS   = 60000;  // background retry of the offline queue
 const KEY_QUEUE    = 'lab.queue';
 const KEY_STUDENTS = 'lab.students';
 
-const JSQR_URL = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js';
-const JSQR_SRI = 'sha384-b5Ya4Bq3qCyz39m2ISh+4DxjAIljdeFwK/BsXLuj9gugaNwAcj/ia15fxNZL9Nlx';
-
 // ---------------------------------------------------------------------------
 // Elements
 // ---------------------------------------------------------------------------
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
-const canvas = $('frame');
 const overlay = $('overlay');
 
 // ---------------------------------------------------------------------------
@@ -288,7 +281,7 @@ function tickClock() {
 // ---------------------------------------------------------------------------
 
 let holdTimer = null;
-let paused = true;              // true whenever something covers the camera
+let scanner = null;             // set once the camera is live
 
 function showOverlay({ tone, kicker, name, detail, note, hold = HOLD_MS }) {
   clearTimeout(holdTimer);
@@ -305,7 +298,7 @@ function showOverlay({ tone, kicker, name, detail, note, hold = HOLD_MS }) {
   void timer.offsetWidth;
   timer.style.animation = '';
   overlay.hidden = false;
-  paused = true;
+  scanner?.pause();             // keep the stream open, stop looking at frames
   holdTimer = setTimeout(resumeScanning, hold);
 }
 
@@ -314,7 +307,7 @@ function resumeScanning() {
   overlay.hidden = true;
   $('enroll-sheet').hidden = true;
   $('pin-sheet').hidden = true;
-  paused = false;
+  scanner?.resume();
 }
 
 // Tapping a confirmation dismisses it early — a queue at the door should not
@@ -322,7 +315,7 @@ function resumeScanning() {
 overlay.addEventListener('click', resumeScanning);
 
 function showFatal(title, message) {
-  paused = true;
+  scanner?.stop();              // release the camera; nothing can be scanned now
   $('fatal-title').textContent = title;
   $('fatal-msg').textContent = message;
   $('fatal-sheet').hidden = false;
@@ -339,31 +332,14 @@ function formatDuration(minutes) {
 
 // ---------------------------------------------------------------------------
 // Scanning
+//
+// js/scanner.js owns the camera and the decode loop. It only calls back for a
+// validated 7-digit payload and it swallows repeats of the same card, so
+// everything below is about what to DO with a scan.
 // ---------------------------------------------------------------------------
 
-let lastCode = null;
-let lastCodeAt = 0;
-let detect = null;               // () => Promise<string|null>
-let decoding = false;
-
-function onCode(raw) {
-  const value = String(raw || '').trim();
-
-  // Students will scan cereal boxes, posters and each other's phones to see
-  // what happens. Anything that is not a bare 7-digit payload is ignored with
-  // no feedback at all, so there is no game to play.
-  if (!isValidStudentId(value)) return;
-
-  const now = Date.now();
-  if (value === lastCode && now - lastCodeAt < REPEAT_LOCKOUT_MS) return;
-  lastCode = value;
-  lastCodeAt = now;
-
-  handleScan(value);
-}
-
 async function handleScan(studentId) {
-  paused = true;
+  scanner?.pause();
   const known = students.get(studentId);
 
   // Apps Script takes a second or two. Say something immediately, using the
@@ -502,7 +478,7 @@ let enrollingId = null;
 function openEnrollment(studentId) {
   clearTimeout(holdTimer);
   overlay.hidden = true;
-  paused = true;
+  scanner?.pause();
   enrollingId = studentId;
   $('enroll-id').textContent = studentId;
   $('enroll-name').value = '';
@@ -552,115 +528,6 @@ $('enroll-cancel').addEventListener('click', () => { enrollingId = null; resumeS
 $('enroll-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveEnrollment(); });
 
 // ---------------------------------------------------------------------------
-// Camera + decoding
-// ---------------------------------------------------------------------------
-
-async function startCamera() {
-  if (!window.isSecureContext) {
-    showFatal('Camera needs HTTPS',
-      'Open this page over https:// (GitHub Pages does this for you). Cameras are blocked on file:// and plain http://.');
-    return false;
-  }
-  if (!navigator.mediaDevices?.getUserMedia) {
-    showFatal('No camera support', 'This browser cannot open a camera. Try Safari or Chrome.');
-    return false;
-  }
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: { ideal: 'environment' },   // rear camera on a wall tablet
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      },
-      audio: false,
-    });
-    video.srcObject = stream;
-    await video.play();
-    return true;
-  } catch (err) {
-    const messages = {
-      NotAllowedError: 'Camera permission was denied. Allow the camera in the browser settings for this page, then try again.',
-      NotFoundError: 'No camera was found on this tablet.',
-      NotReadableError: 'The camera is already in use by another app. Close it and try again.',
-    };
-    showFatal('Camera unavailable', messages[err.name] || err.message);
-    return false;
-  }
-}
-
-function loadScript(src, integrity) {
-  return new Promise((resolve, reject) => {
-    const el = document.createElement('script');
-    el.src = src;
-    if (integrity) { el.integrity = integrity; el.crossOrigin = 'anonymous'; }
-    el.onload = resolve;
-    el.onerror = () => reject(new Error('could not load ' + src));
-    document.head.appendChild(el);
-  });
-}
-
-/**
- * Prefer the native BarcodeDetector — it is hardware-accelerated and costs
- * almost nothing per frame. iPad Safari has no BarcodeDetector at all, so fall
- * back to jsQR from a CDN, pinned with an SRI hash.
- *
- * Either way the detector only ever looks for QR codes. Scanning for linear
- * formats as well would burn frames on a tablet that is already running a live
- * camera preview, and the cards are QR.
- */
-async function buildDetector() {
-  if ('BarcodeDetector' in window) {
-    try {
-      const formats = await window.BarcodeDetector.getSupportedFormats();
-      if (formats.includes('qr_code')) {
-        const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
-        console.info('scanner: using native BarcodeDetector');
-        return async () => {
-          const codes = await detector.detect(video);
-          return codes.length ? codes[0].rawValue : null;
-        };
-      }
-    } catch (err) {
-      console.warn('BarcodeDetector unavailable, falling back to jsQR:', err);
-    }
-  }
-
-  await loadScript(JSQR_URL, JSQR_SRI);
-  if (typeof window.jsQR !== 'function') throw new Error('jsQR did not load');
-  console.info('scanner: using jsQR fallback');
-
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  return () => {
-    if (!video.videoWidth) return null;
-    // Downscale before decoding: jsQR is pure JS and 1280x720 every frame will
-    // heat up an old iPad for no extra accuracy on a card held at the reticle.
-    const scale = Math.min(1, 480 / video.videoWidth);
-    canvas.width = Math.round(video.videoWidth * scale);
-    canvas.height = Math.round(video.videoHeight * scale);
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const code = window.jsQR(image.data, image.width, image.height, { inversionAttempts: 'dontInvert' });
-    return code ? code.data : null;
-  };
-}
-
-let lastDecodeAt = 0;
-
-function decodeLoop(timestamp) {
-  requestAnimationFrame(decodeLoop);
-  if (paused || decoding || !detect) return;
-  if (timestamp - lastDecodeAt < DECODE_INTERVAL_MS) return;
-  lastDecodeAt = timestamp;
-
-  decoding = true;
-  Promise.resolve()
-    .then(detect)
-    .then((raw) => { if (raw) onCode(raw); })
-    .catch((err) => console.warn('decode failed:', err))
-    .finally(() => { decoding = false; });
-}
-
-// ---------------------------------------------------------------------------
 // Screen wake lock — a wall tablet that sleeps is a tablet nobody can scan on
 // ---------------------------------------------------------------------------
 
@@ -697,7 +564,7 @@ let pressTimer = null;
 const statusbar = $('statusbar');
 statusbar.addEventListener('pointerdown', () => {
   pressTimer = setTimeout(() => {
-    paused = true;
+    scanner?.pause();
     $('pin-input').value = '';
     $('pin-sheet').hidden = false;
     setTimeout(() => $('pin-input').focus(), 50);
@@ -753,19 +620,19 @@ async function boot() {
   syncQueue();
   setInterval(syncQueue, SYNC_INTERVAL_MS);
 
-  if (!(await startCamera())) return;
-
+  scanner = createScanner(video, handleScan);
   try {
-    detect = await buildDetector();
+    await scanner.start();
   } catch (err) {
-    showFatal('QR reader unavailable',
-      err.message + '. This tablet needs the internet once to load the QR reader — connect it and reload.');
+    if (err instanceof CameraError && err.kind === 'reader') {
+      showFatal('QR reader unavailable', err.message + '. Connect this tablet to the internet and reload.');
+    } else {
+      showFatal('Camera unavailable', err.message);
+    }
     return;
   }
 
   $('prompt').textContent = 'Scan your card';
-  paused = false;
-  requestAnimationFrame(decodeLoop);
 }
 
 boot();
