@@ -1103,6 +1103,8 @@ function sessionRowHtml(s, opts = {}) {
 }
 
 function summaryRowHtml(summary) {
+  // Namespaced so a summary and a session can never collide in state.confirming.
+  const key = 'summary:' + summary.summary_id;
   const photos = (summary.photo_urls || []).map((url) => {
     const id = driveId(url);
     const full = id ? 'https://drive.google.com/file/d/' + id + '/view' : url;
@@ -1121,9 +1123,24 @@ function summaryRowHtml(summary) {
         <span class="summary__label">SUMMARY</span>
         <span class="session__date">${fmtDate(summary.session_date + 'T12:00')}</span>
         <span class="muted" style="font-size:0.8125rem">submitted ${fmtWhen(summary.submitted_at)}</span>
+        <span style="flex:1"></span>
+        <button class="btn btn--ghost btn-sm" data-action="ask-delete-summary"
+                data-key="${esc(key)}">Delete</button>
       </div>
       <p class="summary__text">${esc(summary.text)}</p>
       ${photos ? `<div class="summary__photos">${photos}</div>` : ''}
+      ${state.confirming === key ? `
+        <div class="confirm" style="margin-top:0.75rem">
+          <strong>Delete this summary?</strong>
+          <span class="muted">It stops showing anywhere${summary.photo_urls.length
+            ? ` and ${summary.photo_urls.length} photo${summary.photo_urls.length === 1 ? '' : 's'} move to the Drive trash, recoverable for 30 days`
+            : ''}. The original row stays in the sheet for the record.</span>
+          <div class="confirm__actions">
+            <button class="btn btn--ghost btn-sm" data-action="cancel-delete">Cancel</button>
+            <button class="btn btn-danger btn-sm" data-action="confirm-delete-summary"
+                    data-key="${esc(key)}">Yes, delete</button>
+          </div>
+        </div>` : ''}
     </div>`;
 }
 
@@ -1222,6 +1239,21 @@ async function saveEdit(key) {
       await api.admin.editEvent(state.pin, eventId, { timestamp, reason });
     }
     state.editing = null;
+    await load();
+  });
+  render();
+}
+
+/**
+ * Anyone with the site URL can post a summary under any student's ID, so a
+ * coach needs a way to take one down. Appends a tombstone and trashes the
+ * photos; nothing is edited or hard-deleted.
+ */
+async function deleteSummary(key) {
+  const summaryId = key.replace(/^summary:/, '');
+  await withBusy(async () => {
+    await api.admin.deleteSummary(state.pin, summaryId, 'deleted from the admin page', { timeoutMs: 60000 });
+    state.confirming = null;
     await load();
   });
   render();
@@ -1363,6 +1395,8 @@ $('view').addEventListener('click', (event) => {
     case 'cancel-edit': state.editing = null; render(); break;
     case 'save-edit':   saveEdit(key); break;
     case 'ask-delete':  state.confirming = key; state.editing = null; render(); break;
+    case 'ask-delete-summary': state.confirming = key; state.editing = null; render(); break;
+    case 'confirm-delete-summary': deleteSummary(key); break;
     case 'cancel-delete': state.confirming = null; render(); break;
     case 'confirm-delete': deleteSession(key); break;
   }

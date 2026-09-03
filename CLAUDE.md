@@ -69,7 +69,17 @@ const detector = new BarcodeDetector({ formats: ['qr_code'] });
 Do not scan for linear/1D formats. It wastes frames on a tablet that is already running
 a live camera feed.
 
-### 5. The service worker caches the shell, never the API
+### 5. Only retryable failures may be queued
+
+`ApiError.isRetryable` — not `isNetwork` — decides whether the tablet queues a
+scan. Retryable means the same request could plausibly succeed later: no answer
+at all, a 5xx, or `retryable:true` from the server (lock contention).
+
+A 4xx must never be retryable. A wrong URL or a dead deployment would otherwise
+queue every scan behind a green "saved, will sync" that never syncs, and the
+loss would surface weeks later as a hole in the timesheet.
+
+### 6. The service worker caches the shell, never the API
 
 `sw.js` handles **only same-origin GET** requests. Every API call is a POST to
 `script.google.com`, so it fails both tests and goes straight to the network.

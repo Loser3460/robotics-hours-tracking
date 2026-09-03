@@ -29,12 +29,21 @@ export class ApiError extends Error {
   constructor(message, kind, cause) {
     super(message);
     this.name = 'ApiError';
-    this.kind = kind;          // 'network' | 'server' | 'config'
+    this.kind = kind;          // 'network' | 'busy' | 'server' | 'config'
     this.cause = cause;
   }
-  /** True when the request never got a usable answer — safe to retry later. */
+  /** True when the request never got a usable answer. */
   get isNetwork() {
     return this.kind === 'network';
+  }
+  /**
+   * True when the SAME request is worth sending again later: no answer at all,
+   * or the server said it was momentarily busy. A wrong URL or a rejected
+   * payload is NOT retryable — retrying those forever is how a broken
+   * deployment turns into a queue of scans that never sync.
+   */
+  get isRetryable() {
+    return this.kind === 'network' || this.kind === 'busy';
   }
 }
 
@@ -101,7 +110,19 @@ export async function request(action, payload = {}, options = {}) {
   }
 
   if (!response.ok) {
-    throw new ApiError(`server returned HTTP ${response.status}`, 'network');
+    // 5xx and 429 are Google having a moment: retry those.
+    // A 4xx means the URL or the deployment is wrong, and treating that as
+    // retryable is actively harmful — the tablet would queue every scan behind
+    // a cheerful "saved, will sync" that never syncs, and the loss would only
+    // surface when a coach noticed a week missing from the timesheet.
+    if (response.status >= 500 || response.status === 429) {
+      throw new ApiError(`the server is having trouble (HTTP ${response.status})`, 'network');
+    }
+    throw new ApiError(
+      response.status === 404
+        ? 'the API URL is wrong or that deployment no longer exists (HTTP 404) — check config.js'
+        : `the server rejected the request (HTTP ${response.status})`,
+      response.status === 404 ? 'config' : 'server');
   }
 
   const text = await response.text();
@@ -121,7 +142,10 @@ export async function request(action, payload = {}, options = {}) {
   }
 
   if (!body || typeof body !== 'object') throw new ApiError('malformed response', 'server');
-  if (body.ok === false) throw new ApiError(String(body.error || 'unknown server error'), 'server');
+  // The backend marks lock contention retryable so a scan is queued, not lost.
+  if (body.ok === false) {
+    throw new ApiError(String(body.error || 'unknown server error'), body.retryable ? 'busy' : 'server');
+  }
   return body.data;
 }
 
@@ -182,6 +206,9 @@ export const admin = {
   /** Every summary in one call, or one student's with studentId. */
   getSummaries: (pin, studentId = null, options = {}) =>
     request('getSummaries', studentId ? { pin, student_id: studentId } : { pin }, options),
+  /** Appends a tombstone and trashes the photos; the row stays for the record. */
+  deleteSummary: (pin, summaryId, reason = '', options = {}) =>
+    request('deleteSummary', { pin, summary_id: summaryId, reason }, options),
   /** Appends a correction; the original event row is never modified. */
   editEvent: (pin, eventId, { timestamp = null, direction = null, reason = '' } = {}, options = {}) =>
     request('editEvent', { pin, event_id: eventId, timestamp, direction, reason }, options),

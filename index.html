@@ -201,6 +201,7 @@ import { createScanner, CameraError } from './js/scanner.js';
 const HOLD_MS            = 4000;   // how long a confirmation stays up
 const BRIEF_MS           = 1800;   // for minor notices
 const SYNC_INTERVAL_MS   = 60000;  // background retry of the offline queue
+const MAX_QUEUE          = 500;    // beyond this, something is broken, not slow
 
 const KEY_QUEUE    = 'lab.queue';
 const KEY_STUDENTS = 'lab.students';
@@ -264,9 +265,11 @@ const queue = {
 function renderStatus() {
   const badge = $('queue-badge');
   if (queue.length) {
-    badge.textContent = queue.length === 1
-      ? '1 scan waiting to sync'
-      : queue.length + ' scans waiting to sync';
+    const stuck = syncFailures >= 3;
+    badge.textContent = stuck
+      ? queue.length + ' scans not syncing — tell a coach'
+      : (queue.length === 1 ? '1 scan waiting to sync' : queue.length + ' scans waiting to sync');
+    badge.classList.toggle('badge--offline', stuck);
     badge.hidden = false;
   } else {
     badge.hidden = true;
@@ -358,7 +361,9 @@ async function handleScan(studentId) {
   try {
     result = await api.scan(studentId);
   } catch (err) {
-    if (err instanceof ApiError && err.isNetwork) return queueScan(studentId, known);
+    // Queue only what is worth sending again. A wrong URL or a rejected scan
+    // must show an error, not a green "saved, will sync" that never does.
+    if (err instanceof ApiError && err.isRetryable) return queueScan(studentId, known);
     return showOverlay({
       tone: 'error',
       kicker: 'Something went wrong',
@@ -412,6 +417,15 @@ function celebrate(result) {
  * refuses client timestamps in every other case.
  */
 function queueScan(studentId, known) {
+  if (queue.length >= MAX_QUEUE) {
+    return showOverlay({
+      tone: 'error',
+      kicker: 'Not saved',
+      name: (known && known.name) || studentId,
+      detail: 'This tablet has ' + queue.length + ' scans it cannot send',
+      note: 'Tell a coach — do not keep scanning',
+    });
+  }
   // Guess the direction from what this tablet last saw, so the student still
   // gets the right greeting and the replay carries what they were told.
   const direction = known && known.direction === 'in' ? 'out' : 'in';
@@ -439,6 +453,7 @@ function queueScan(studentId, known) {
 }
 
 let syncing = false;
+let syncFailures = 0;
 
 async function syncQueue() {
   if (syncing || !queue.length || navigator.onLine === false) return;
@@ -463,9 +478,13 @@ async function syncQueue() {
       return true;
     });
     queue.save();
+    syncFailures = 0;
   } catch (err) {
-    // Still offline, or the server is unhappy. Keep everything and try later.
-    console.warn('queue sync failed:', err.message);
+    // Still offline, or the server is unhappy. Keep everything and try later —
+    // but count the failures, because a queue that never drains is a broken
+    // deployment, not a slow night, and nobody watches a badge that looks calm.
+    syncFailures++;
+    console.warn('queue sync failed (' + syncFailures + '):', err.message);
   } finally {
     syncing = false;
     renderStatus();

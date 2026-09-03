@@ -103,6 +103,21 @@ function fail_(message) {
   throw e;
 }
 
+/**
+ * Like fail_, but marks the response {retryable:true}.
+ *
+ * Only for failures where the SAME request would plausibly succeed a moment
+ * later — lock contention, essentially. The tablet queues a retryable scan
+ * instead of discarding it, which matters because contention is exactly when
+ * two students are at the door at once.
+ */
+function failRetryable_(message) {
+  var e = new Error(message);
+  e.apiError = true;
+  e.retryable = true;
+  throw e;
+}
+
 // ---------------------------------------------------------------------------
 // Entry points
 // ---------------------------------------------------------------------------
@@ -171,6 +186,7 @@ function doPost(e) {
       case 'getTimesheet':  return json_(actionGetTimesheet_(payload));
       case 'getStudent':    return json_(actionGetStudent_(payload));
       case 'getSummaries':  return json_(actionGetSummaries_(payload));
+      case 'deleteSummary': return json_(actionDeleteSummary_(payload));
       case 'editEvent':     return json_(actionEditEvent_(payload));
       case 'deleteEvent':   return json_(actionDeleteEvent_(payload));
       case 'setActive':     return json_(actionSetActive_(payload));
@@ -179,7 +195,9 @@ function doPost(e) {
     }
   } catch (err) {
     if (err && err.apiError) {
-      return json_({ ok: false, error: err.message });
+      var body = { ok: false, error: err.message };
+      if (err.retryable) body.retryable = true;
+      return json_(body);
     }
     // Unexpected: log the stack for the execution log, return something terse.
     console.error('doPost failed', err && err.stack ? err.stack : err,
@@ -201,7 +219,9 @@ function doPost(e) {
 function withLock_(fn) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(LOCK_TIMEOUT_MS)) {
-    fail_('the sheet is busy, try again');
+    // Retryable on purpose: another scan is mid-write. Reporting this as a
+    // plain error made the tablet drop the scan outright.
+    failRetryable_('the sheet is busy, try again');
   }
   try {
     return fn();
@@ -894,7 +914,7 @@ function actionLookupStudent_(p) {
     out.date = date;
     out.sessions = sessions;
 
-    var summaries = readTable_(TAB_SUMMARIES);
+    var summaries = resolveSummaries_(readTable_(TAB_SUMMARIES));
     var already = 0;
     for (var s = 0; s < summaries.length; s++) {
       if (normId_(summaries[s].student_id) !== studentId) continue;
@@ -904,6 +924,33 @@ function actionLookupStudent_(p) {
   }
 
   return ok_(out);
+}
+
+/**
+ * Summaries with voided ones removed.
+ *
+ * Same append-only shape as the event log: deleting a summary appends a
+ * tombstone whose text is "void:<summary_id> — reason", and both rows drop out
+ * here while staying in the sheet for the record.
+ */
+function resolveSummaries_(rows) {
+  var dropped = {};
+  var kept = [];
+  for (var i = 0; i < rows.length; i++) {
+    var id = String(rows[i].summary_id || '').trim();
+    if (!id) continue;
+    var m = /^void:(\S+)/.exec(String(rows[i].text || '').trim());
+    if (m) {
+      dropped[m[1]] = true;
+      dropped[id] = true;          // the tombstone is not itself a summary
+    }
+    kept.push(rows[i]);
+  }
+  var out = [];
+  for (var j = 0; j < kept.length; j++) {
+    if (!dropped[String(kept[j].summary_id).trim()]) out.push(kept[j]);
+  }
+  return out;
 }
 
 /** session_date can come back as text or as a Date, depending on the cell. */
@@ -1189,7 +1236,7 @@ function actionGetStudent_(p) {
   }
 
   var summaries = [];
-  var summaryRows = readTable_(TAB_SUMMARIES);
+  var summaryRows = resolveSummaries_(readTable_(TAB_SUMMARIES));
   for (var s = 0; s < summaryRows.length; s++) {
     if (normId_(summaryRows[s].student_id) !== studentId) continue;
     summaries.push({
@@ -1311,7 +1358,7 @@ function actionDeleteEvent_(p) {
 function actionGetSummaries_(p) {
   requirePin_(p);
   var studentId = p.student_id ? requireId_(p.student_id) : null;
-  var rows = readTable_(TAB_SUMMARIES);
+  var rows = resolveSummaries_(readTable_(TAB_SUMMARIES));
   var out = [];
   for (var i = 0; i < rows.length; i++) {
     var sid = normId_(rows[i].student_id);
@@ -1329,6 +1376,76 @@ function actionGetSummaries_(p) {
   }
   out.sort(function (a, b) { return a.submitted_at < b.submitted_at ? 1 : -1; });
   return ok_({ summaries: out, count: out.length, generated_at: nowIso_() });
+}
+
+/**
+ * Remove a summary — by appending a tombstone, never by editing the sheet.
+ *
+ * This is the coach's only recourse when something inappropriate is posted, and
+ * since anyone with the URL can submit a summary under any ID, it needs to be
+ * genuinely effective: the photos are moved to the Drive trash too. Trash, not
+ * a permanent delete, so a mistake is recoverable for 30 days.
+ */
+function actionDeleteSummary_(p) {
+  requirePin_(p);
+  var summaryId = requireStr_(p, 'summary_id', 64);
+  var reason = String(p.reason || p.note || '').trim();
+  var trashPhotos = p.trash_photos === undefined ? true : truthy_(p.trash_photos);
+
+  return withLock_(function () {
+    var rows = readTable_(TAB_SUMMARIES);
+    var live = resolveSummaries_(rows);
+    var target = null;
+    for (var i = 0; i < live.length; i++) {
+      if (String(live[i].summary_id).trim() === summaryId) { target = live[i]; break; }
+    }
+    if (!target) {
+      var existed = false;
+      for (var j = 0; j < rows.length; j++) {
+        if (String(rows[j].summary_id).trim() === summaryId) existed = true;
+      }
+      fail_(existed ? 'summary ' + summaryId + ' has already been deleted'
+                    : 'no summary with id ' + summaryId);
+    }
+
+    var urls = splitUrls_(target.photo_urls);
+    var trashed = [];
+    if (trashPhotos) {
+      for (var u = 0; u < urls.length; u++) {
+        var id = driveIdFromUrl_(urls[u]);
+        if (!id) continue;
+        try {
+          DriveApp.getFileById(id).setTrashed(true);
+          trashed.push(id);
+        } catch (err) {
+          console.warn('could not trash ' + id + ': ' + err);
+        }
+      }
+    }
+
+    appendRows_(TAB_SUMMARIES, [[
+      newId_('void'),
+      normId_(target.student_id),
+      summaryDate_(target),
+      'void:' + summaryId + (reason ? ' — ' + reason : ''),
+      '',
+      nowIso_()
+    ]]);
+
+    return ok_({
+      deleted: summaryId,
+      student_id: normId_(target.student_id),
+      session_date: summaryDate_(target),
+      photos_trashed: trashed.length,
+      photos_total: urls.length
+    });
+  });
+}
+
+/** Pull the Drive file id out of whichever URL shape we stored. */
+function driveIdFromUrl_(url) {
+  var m = /[?&]id=([A-Za-z0-9_-]+)/.exec(url) || /\/d\/([A-Za-z0-9_-]+)/.exec(url);
+  return m ? m[1] : null;
 }
 
 function splitUrls_(value) {
