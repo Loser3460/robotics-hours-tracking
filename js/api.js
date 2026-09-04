@@ -199,9 +199,21 @@ export function submitSummary(studentId, text, photos = [], sessionDate = null, 
 // preflight described at the top of this file.
 
 export const admin = {
-  getRoster: (pin, options = {}) => request('getRoster', { pin }, options),
-  getTimesheet: (pin, { from = null, to = null, studentId = null } = {}, options = {}) =>
-    request('getTimesheet', { pin, from, to, student_id: studentId }, options),
+  /**
+   * The roster. `slim` asks for id/name/grade/active only — the four columns
+   * the admin table draws — and lets the backend skip reading and replaying the
+   * event log for statistics the admin page recomputes locally anyway. The
+   * tablet's roster prime leaves it off, because it wants currently_in.
+   */
+  getRoster: (pin, { slim = false } = {}, options = {}) =>
+    request('getRoster', { pin, slim }, options),
+  /**
+   * Sessions. `slim` drops the pre-formatted local clock strings and the
+   * per-student totals block; the admin page formats its own times and groups
+   * its own totals from rows it already holds.
+   */
+  getTimesheet: (pin, { from = null, to = null, studentId = null, slim = false } = {}, options = {}) =>
+    request('getTimesheet', { pin, from, to, student_id: studentId, slim }, options),
   getStudent: (pin, studentId, options = {}) => request('getStudent', { pin, student_id: studentId }, options),
   /** Every summary in one call, or one student's with studentId. */
   getSummaries: (pin, studentId = null, options = {}) =>
@@ -209,18 +221,24 @@ export const admin = {
   /** Appends a tombstone and trashes the photos; the row stays for the record. */
   deleteSummary: (pin, summaryId, reason = '', options = {}) =>
     request('deleteSummary', { pin, summary_id: summaryId, reason }, options),
-  /** Appends a correction; the original event row is never modified. */
+  /**
+   * Appends a correction; the original event row is never modified.
+   * Resolves with `sessions`: that student's whole timeline, rebuilt server-side.
+   * Superseding a check-in can re-pair the sessions around it, so this is the
+   * authoritative answer — patch state with it rather than re-fetching.
+   */
   editEvent: (pin, eventId, { timestamp = null, direction = null, reason = '' } = {}, options = {}) =>
     request('editEvent', { pin, event_id: eventId, timestamp, direction, reason }, options),
-  /** Appends a tombstone; the original event row is never deleted. */
+  /** Appends a tombstone; the original event row is never deleted. Also resolves with `sessions`. */
   deleteEvent: (pin, eventId, reason = '', options = {}) =>
     request('deleteEvent', { pin, event_id: eventId, reason }, options),
+  /** Resolves with `student`: the updated roster record, ready to patch in. */
   setActive: (pin, studentId, active, options = {}) =>
     request('setActive', { pin, student_id: studentId, active }, options),
   /**
    * Correct a student's name. Name is roster data, not attendance data — the
    * event log stores only student_id, so a rename changes no hour and no
-   * session. Resolves to {student_id, name, previous_name, changed}.
+   * session. Resolves to {student_id, name, previous_name, changed, student}.
    */
   setName: (pin, studentId, name, options = {}) =>
     request('setName', { pin, student_id: studentId, name }, options),

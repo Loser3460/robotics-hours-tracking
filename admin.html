@@ -253,6 +253,46 @@
     border: 1px solid var(--error); border-radius: 0.5rem;
     background: rgba(164, 35, 47, 0.12);
   }
+  /* ---- optimistic-write chrome ----
+     Both of these are deliberately quiet. The point of optimistic updates is
+     that the coach never waits, so anything that flashes, blocks or disables a
+     control would put the waiting back. */
+  .saving {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    font-size: 0.8125rem; color: var(--text-dim);
+  }
+  .saving__dot {
+    width: 0.5rem; height: 0.5rem; border-radius: 50%;
+    background: var(--text-dim); animation: saving-pulse 1s ease-in-out infinite;
+  }
+  @keyframes saving-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    .saving__dot { animation: none; opacity: 0.7; }
+  }
+
+  .toasts {
+    position: fixed; z-index: 20;
+    left: 50%; transform: translateX(-50%);
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 1.25rem);
+    display: flex; flex-direction: column; gap: 0.5rem;
+    width: min(32rem, calc(100vw - 2rem));
+    pointer-events: none;
+  }
+  .toast {
+    pointer-events: auto;
+    display: flex; align-items: flex-start; gap: 0.75rem;
+    padding: 0.8rem 1rem;
+    border: 1px solid var(--error); border-radius: 0.5rem;
+    background: var(--bg-raised);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+    font-size: 0.9rem;
+  }
+  .toast__msg { flex: 1; }
+  .toast__close {
+    background: none; border: 0; color: var(--text-dim);
+    font-size: 1.1rem; line-height: 1; cursor: pointer; padding: 0 0.2rem;
+  }
+
   .empty { padding: 3rem 1rem; text-align: center; color: var(--text-dim); }
   .gate { min-height: 100vh; display: grid; place-items: center; padding: 1.5rem; }
   .gate__card { width: min(26rem, 100%); display: flex; flex-direction: column; gap: 1rem; padding: 2rem; }
@@ -295,6 +335,9 @@
       <button class="tab" id="tab-flagged" role="tab" aria-selected="false">Needs review<span class="tab__count" id="flag-count" hidden></span></button>
     </div>
     <span class="topbar__spacer"></span>
+    <!-- Unobtrusive on purpose. A write is in flight, the interface stays
+         live, and this is the only thing that moves. -->
+    <span class="saving" id="saving" hidden><span class="saving__dot"></span>Saving…</span>
     <span class="muted" id="freshness" style="font-size:0.875rem"></span>
     <button class="btn btn--ghost btn-sm" id="refresh" type="button">Refresh</button>
     <button class="btn btn--ghost btn-sm" id="lock" type="button">Lock</button>
@@ -307,6 +350,10 @@
     </div>
     <div id="view"></div>
   </main>
+
+  <!-- Failed writes land here. A rolled-back change has already vanished from
+       the table by the time this appears, so it has to say what was undone. -->
+  <div class="toasts" id="toasts" aria-live="polite"></div>
 </div>
 
 <script type="module">
@@ -595,9 +642,14 @@ async function load() {
   // and when that was fatal it locked a coach out of the roster and timesheet
   // entirely — over a feature they may not even be using. Now it degrades: the
   // hours still load and a banner says what is missing and why.
+  // Both slim: this page draws four roster columns and formats its own times,
+  // and it recomputes every statistic locally from the sessions below, so the
+  // server's per-student stats blocks were built and shipped only to be
+  // dropped on the floor. Asking for less also lets getRoster skip replaying
+  // the event log entirely.
   const [roster, timesheet] = await Promise.all([
-    api.admin.getRoster(state.pin, { timeoutMs: 30000 }),
-    api.admin.getTimesheet(state.pin, {}, { timeoutMs: 60000 }),
+    api.admin.getRoster(state.pin, { slim: true }, { timeoutMs: 30000 }),
+    api.admin.getTimesheet(state.pin, { slim: true }, { timeoutMs: 60000 }),
   ]);
   const summaries = await api.admin.getSummaries(state.pin, null, { timeoutMs: 60000 })
     .catch((err) => {
@@ -1263,6 +1315,95 @@ async function withBusy(fn) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Optimistic writes
+//
+// Every one of these actions used to be: send the mutation, wait, then re-fetch
+// the roster, the whole timesheet and every summary, wait again, then re-render.
+// Four serial round-trips to Apps Script to rename a student — about five
+// seconds of a dead-looking page for a change we could already predict.
+//
+// Now the local state changes first and the page re-renders on the spot; the
+// request goes out behind it. Three rules keep that honest:
+//
+//   1. Every apply() returns its own undo. If the request fails the undo runs,
+//      the row snaps back, and a toast says what did not save. Silent rollback
+//      would be worse than the wait it replaced.
+//   2. The server's answer wins. Each mutation returns the record it wrote, and
+//      reconcile() patches it over the guess. Where the two can legitimately
+//      differ — superseding a check-in can re-pair the sessions around it — the
+//      server is the one that knows, and this is where the guess is corrected.
+//   3. Nothing here re-fetches. If a handler cannot patch state from what came
+//      back, that is a reason to return more from the endpoint, not to reload.
+// ---------------------------------------------------------------------------
+
+let savingCount = 0;
+
+function renderSaving() {
+  $('saving').hidden = savingCount === 0;
+}
+
+/**
+ * Show a failure without stealing focus or blocking anything. The banner is
+ * for "the page could not load"; this is for "that one change did not stick",
+ * which has to be dismissible and must not move the layout under a cursor.
+ */
+function toast(message) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.innerHTML = `<span class="toast__msg">${esc(message)}</span>` +
+    `<button class="toast__close" type="button" aria-label="Dismiss">&times;</button>`;
+  el.querySelector('.toast__close').addEventListener('click', () => el.remove());
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 8000);
+}
+
+/**
+ * Apply a change locally, render, and send it in the background.
+ *
+ * @param {() => (() => void)} apply  mutate state now; return the rollback
+ * @param {() => Promise<any>} send   the request
+ * @param {(data: any) => void} [reconcile]  patch state with the server's record
+ * @param {string} whatFailed  named in the toast if the write is rejected
+ */
+function optimistic(apply, send, reconcile, whatFailed) {
+  const rollback = apply();
+  render();
+
+  savingCount += 1;
+  renderSaving();
+
+  send()
+    .then((data) => {
+      if (reconcile) reconcile(data);
+      $('banner').hidden = true;
+      render();
+    })
+    .catch((err) => {
+      rollback();
+      render();
+      toast(whatFailed + ' — ' + (err instanceof ApiError ? err.message : String(err)));
+    })
+    .finally(() => {
+      savingCount -= 1;
+      renderSaving();
+    });
+}
+
+/** Replace one student's sessions everywhere they are indexed. */
+function setStudentSessions(studentId, sessions) {
+  const sorted = sessions.slice().sort((a, b) =>
+    String(a.in_time || a.out_time).localeCompare(String(b.in_time || b.out_time)));
+  state.byStudent.set(studentId, sorted);
+  state.sessions = state.sessions.filter((s) => s.student_id !== studentId).concat(sorted);
+}
+
+/** Snapshot a student's sessions so a failed edit can put them back exactly. */
+function snapshotSessions(studentId) {
+  const before = (state.byStudent.get(studentId) || []).slice();
+  return () => setStudentSessions(studentId, before);
+}
+
 /**
  * Save a correction. Each changed end of the session is a separate append —
  * editEvent supersedes one event id at a time — so a session with both ends
@@ -1292,14 +1433,45 @@ async function saveEdit(key) {
 
   if (!jobs.length) { state.editing = null; render(); return; }
 
-  await withBusy(async () => {
-    for (const [eventId, timestamp] of jobs) {
-      await api.admin.editEvent(state.pin, eventId, { timestamp, reason });
-    }
-    state.editing = null;
-    await load();
-  });
-  render();
+  const studentId = session.student_id;
+  state.editing = null;
+
+  optimistic(
+    () => {
+      // Predict the obvious part: the times the coach just typed. The pairing
+      // of events into sessions is the server's call — if this edit moves a
+      // check-in past a neighbouring check-out the sessions re-pair, and
+      // reconcile() below replaces this guess with the real timeline.
+      const undo = snapshotSessions(studentId);
+      const live = (state.byStudent.get(studentId) || []).map((s) => {
+        if (sessionKey(s) !== key) return s;
+        const next = { ...s };
+        for (const [eventId, timestamp] of jobs) {
+          if (eventId === s.in_event_id) next.in_time = timestamp;
+          if (eventId === s.out_event_id) next.out_time = timestamp;
+        }
+        next.minutes = next.in_time && next.out_time && next.status === 'closed'
+          ? Math.max(0, Math.round((new Date(next.out_time) - new Date(next.in_time)) / 60000))
+          : next.minutes;
+        next.flagged = true;            // a hand-entered time is unverified, as on the server
+        return next;
+      });
+      setStudentSessions(studentId, live);
+      return undo;
+    },
+    async () => {
+      // Still serial: editEvent supersedes one event id at a time, and the
+      // second call has to target an id the first did not replace. The
+      // difference is that nobody is watching a frozen page while it runs.
+      let last = null;
+      for (const [eventId, timestamp] of jobs) {
+        last = await api.admin.editEvent(state.pin, eventId, { timestamp, reason });
+      }
+      return last;
+    },
+    (data) => { if (data && data.sessions) setStudentSessions(studentId, data.sessions); },
+    'Could not save the correction'
+  );
 }
 
 /**
@@ -1309,27 +1481,53 @@ async function saveEdit(key) {
  */
 async function deleteSummary(key) {
   const summaryId = key.replace(/^summary:/, '');
-  await withBusy(async () => {
-    await api.admin.deleteSummary(state.pin, summaryId, 'deleted from the admin page', { timeoutMs: 60000 });
-    state.confirming = null;
-    await load();
-  });
-  render();
+  state.confirming = null;
+
+  optimistic(
+    () => {
+      // Find it first: the rollback has to restore it at its original index.
+      let owner = null, index = -1, removed = null;
+      for (const [studentId, list] of state.summariesByStudent) {
+        const at = list.findIndex((x) => String(x.summary_id) === summaryId);
+        if (at >= 0) { owner = studentId; index = at; removed = list[at]; break; }
+      }
+      if (!owner) return () => {};
+      state.summariesByStudent.get(owner).splice(index, 1);
+      return () => { state.summariesByStudent.get(owner).splice(index, 0, removed); };
+    },
+    () => api.admin.deleteSummary(state.pin, summaryId, 'deleted from the admin page', { timeoutMs: 60000 }),
+    null,
+    'Could not delete the summary'
+  );
 }
 
 async function deleteSession(key) {
   const session = findSession(key);
   if (!session) return;
   const ids = [session.in_event_id, session.out_event_id].filter(Boolean);
+  const studentId = session.student_id;
+  state.confirming = null;
 
-  await withBusy(async () => {
-    for (const id of ids) {
-      await api.admin.deleteEvent(state.pin, id, 'deleted from the admin page');
-    }
-    state.confirming = null;
-    await load();
-  });
-  render();
+  optimistic(
+    () => {
+      const undo = snapshotSessions(studentId);
+      setStudentSessions(studentId,
+        (state.byStudent.get(studentId) || []).filter((s) => sessionKey(s) !== key));
+      return undo;
+    },
+    async () => {
+      let last = null;
+      for (const id of ids) {
+        last = await api.admin.deleteEvent(state.pin, id, 'deleted from the admin page');
+      }
+      return last;
+    },
+    // Voiding one end of a session can leave the other end as an orphan or an
+    // unclosed session rather than removing the row outright, so take the
+    // server's rebuilt timeline over the row we just hid.
+    (data) => { if (data && data.sessions) setStudentSessions(studentId, data.sessions); },
+    'Could not delete the session'
+  );
 }
 
 async function addStudent() {
@@ -1341,11 +1539,19 @@ async function addStudent() {
   if (!/^\d{7}$/.test(id)) { msg.textContent = 'The ID must be exactly 7 digits.'; return; }
   if (name.length < 2) { msg.textContent = 'Enter a full name.'; return; }
 
+  // The one write that is NOT optimistic. enroll is the duplicate-ID check —
+  // showing a student on the roster and then yanking them back out because the
+  // ID was already taken is worse than a moment's wait on the form that is
+  // already showing "Saving…". It still patches instead of re-fetching.
   msg.textContent = 'Saving…';
   await withBusy(async () => {
-    await api.enroll(id, name, grade);
+    const created = await api.enroll(id, name, grade);
+    state.students.push({
+      student_id: created.student_id, name: created.name,
+      grade: created.grade, active: created.active,
+    });
+    state.students.sort((a, b) => a.name.localeCompare(b.name));
     state.adding = false;
-    await load();
   });
   render();
 }
@@ -1363,21 +1569,42 @@ async function saveRename(studentId) {
   if (name.length < 2) { if (msg) msg.textContent = 'Enter a full name.'; return; }
   if (!student || name === student.name) { state.renaming = null; render(); return; }
 
-  if (msg) msg.textContent = 'Saving…';
-  await withBusy(async () => {
-    await api.admin.setName(state.pin, studentId, name);
-    state.renaming = null;
-    await load();
-  });
-  render();
+  state.renaming = null;
+  const previous = student.name;
+
+  optimistic(
+    () => {
+      student.name = name;
+      state.students.sort((a, b) => a.name.localeCompare(b.name));
+      // Sessions carry a denormalised copy of the name for the timesheet's
+      // student column, so it has to move too or the rename half-lands.
+      for (const s of state.sessions) if (s.student_id === studentId) s.name = name;
+      return () => {
+        student.name = previous;
+        state.students.sort((a, b) => a.name.localeCompare(b.name));
+        for (const s of state.sessions) if (s.student_id === studentId) s.name = previous;
+      };
+    },
+    () => api.admin.setName(state.pin, studentId, name),
+    (data) => { if (data && data.student) Object.assign(student, data.student); },
+    `Could not rename ${previous}`
+  );
 }
 
 async function toggleActive(studentId, currentlyActive) {
-  await withBusy(async () => {
-    await api.admin.setActive(state.pin, studentId, !currentlyActive);
-    await load();
-  });
-  render();
+  const student = state.students.find((s) => s.student_id === studentId);
+  if (!student) return;
+  const next = !currentlyActive;
+
+  optimistic(
+    () => {
+      student.active = next;
+      return () => { student.active = currentlyActive; };
+    },
+    () => api.admin.setActive(state.pin, studentId, next),
+    (data) => { if (data && data.student) Object.assign(student, data.student); },
+    `Could not ${next ? 'restore' : 'archive'} ${student.name}`
+  );
 }
 
 function applyPreset(preset) {

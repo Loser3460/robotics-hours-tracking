@@ -31,7 +31,13 @@
 // v3: admin rename. api.js is served stale-while-revalidate, so without this
 // bump the new admin.html loads against the previously cached api.js and calls
 // an admin.setName that isn't there yet.
-const VERSION = 'v3';
+// v4: scanner ROI. index.html's reticle and scanner.js's crop have to agree,
+// and they are cached separately — a stale pair draws the box in one place and
+// decodes another.
+// v5: admin.getRoster grew an options argument before the request options. A
+// stale api.js would swallow index.html's timeoutMs as the new argument, so
+// the pair has to land together.
+const VERSION = 'v5';
 const CACHE = 'lab-shell-' + VERSION;
 
 /** Everything needed to boot the scanner with no network at all. */

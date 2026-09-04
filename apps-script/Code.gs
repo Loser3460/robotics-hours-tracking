@@ -259,6 +259,21 @@ function sheet_(name) {
  * Students.active — which is the only mutable cell in the whole schema.
  */
 function readTable_(name) {
+  if (TABLE_MEMO_.hasOwnProperty(name)) return TABLE_MEMO_[name];
+  var rows = cacheGetTable_(name);
+  if (!rows) {
+    // Note the generation BEFORE touching the sheet, and refuse to cache if it
+    // moved while we were reading — see cachePutTable_.
+    var gen = tableGen_(name);
+    rows = loadTable_(name);
+    cachePutTable_(name, rows, gen);
+  }
+  TABLE_MEMO_[name] = rows;
+  return rows;
+}
+
+/** The uncached read. Only readTable_ and the cache layer call this. */
+function loadTable_(name) {
   var values = sheet_(name).getDataRange().getValues();
   var header = HEADERS[name];
   if (!values.length) return [];
@@ -289,12 +304,215 @@ function isBlankRow_(row) {
   return true;
 }
 
-/** Append rows to a tab in one setValues() call. Caller must hold the lock. */
+/**
+ * Append rows to a tab in one setValues() call. Caller must hold the lock.
+ *
+ * This is also the single choke point for cache invalidation on the append-only
+ * tabs: scan, enroll, syncQueue, submitSummary, editEvent, deleteEvent and
+ * deleteSummary all reach the sheet through here, so none of them has to
+ * remember to drop the key. The two in-place cell writes (Students.active and
+ * Students.name) do not, and invalidate for themselves.
+ */
 function appendRows_(name, rows) {
   if (!rows.length) return;
   var sh = sheet_(name);
   var width = HEADERS[name].length;
   sh.getRange(sh.getLastRow() + 1, 1, rows.length, width).setValues(rows);
+  invalidateTable_(name);
+}
+
+// ---------------------------------------------------------------------------
+// Table cache
+//
+// Reading a tab costs a Sheets round-trip — tens to hundreds of milliseconds,
+// and every admin page load wants Students, Events and Summaries. CacheService
+// is an order of magnitude faster, so the tabs are serialized into it and the
+// sheet is only touched on a miss or after a write.
+//
+// Three things this layer must get right, in order of how badly they bite:
+//
+//   1. It is never a source of truth. Every failure — a miss, an eviction, a
+//      quota error, a value that will not parse — falls through to the sheet.
+//      Nothing here may throw.
+//   2. A write invalidates before the next read. Every append goes through
+//      appendRows_ above; the two setValue writes call invalidateTable_
+//      themselves. A stale roster showing an archived student as active is the
+//      failure this guards against.
+//   3. Cached rows must be INDISTINGUISHABLE from freshly read ones. A sheet
+//      cell can hold a Date, and JSON turns Dates into strings — which would
+//      quietly change summaryDate_(), because it branches on `instanceof Date`
+//      and formats a real Date in the local timezone but reads a string
+//      verbatim. Dates are therefore tagged on the way in and revived on the
+//      way out, so both paths hand back the same objects.
+// ---------------------------------------------------------------------------
+
+/** Per-execution memo: two readTable_(Events) in one request cost one parse. */
+var TABLE_MEMO_ = {};
+
+var CACHE_TTL_SEC = 21600;      // six hours, the CacheService maximum
+var CACHE_CHUNK_CHARS = 32000;  // a cached value caps at 100KB; UTF-8 is <=3B/char
+var CACHE_MAX_CHUNKS = 40;      // ~1.2MB of JSON; past that, just read the sheet
+
+function cacheKey_(name) {
+  return 'tbl.v1.' + name;
+}
+
+function genKey_(name) {
+  return 'gen.v1.' + name;
+}
+
+/**
+ * The tab's current generation — an opaque token that changes on every write.
+ *
+ * This exists to close a race that dropping the key alone does not. Reads take
+ * no lock, so a reader can load the sheet, a writer can then commit and
+ * invalidate, and the reader can afterwards store what it read — parking data
+ * that was already stale in a six-hour cache. Comparing the generation across
+ * the sheet read catches exactly that overlap.
+ *
+ * A missing token (evicted, or a cold script) reads as "unknowable", which
+ * makes the caller skip caching this once. Losing a cache fill is free;
+ * serving a stale roster is not.
+ */
+function tableGen_(name) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var g = cache.get(genKey_(name));
+    if (!g) {
+      g = Utilities.getUuid();
+      cache.put(genKey_(name), g, CACHE_TTL_SEC);
+    }
+    return g;
+  } catch (err) {
+    return null;
+  }
+}
+
+/** Date -> {__d: epoch millis}. Everything else is already JSON-safe. */
+function encodeRows_(rows) {
+  var out = [];
+  for (var i = 0; i < rows.length; i++) {
+    var src = rows[i], dst = {};
+    for (var k in src) {
+      if (!src.hasOwnProperty(k)) continue;
+      var v = src[k];
+      if (v instanceof Date) {
+        var t = v.getTime();
+        dst[k] = isNaN(t) ? '' : { __d: t };
+      } else {
+        dst[k] = v;
+      }
+    }
+    out.push(dst);
+  }
+  return out;
+}
+
+function decodeRows_(rows) {
+  for (var i = 0; i < rows.length; i++) {
+    var row = rows[i];
+    for (var k in row) {
+      if (!row.hasOwnProperty(k)) continue;
+      var v = row[k];
+      if (v && typeof v === 'object' && typeof v.__d === 'number') row[k] = new Date(v.__d);
+    }
+  }
+  return rows;
+}
+
+/**
+ * Read a tab out of the cache, or null on any kind of miss.
+ *
+ * Chunked, because a value caps at 100KB and Events outgrows that. The manifest
+ * holds "<count>|<stamp>" and each chunk key carries the same stamp, so a
+ * partially evicted or concurrently rewritten set can never be reassembled into
+ * a Frankenstein table — a stamp mismatch or a missing chunk is just a miss.
+ */
+function cacheGetTable_(name) {
+  try {
+    var cache = CacheService.getScriptCache();
+    var key = cacheKey_(name);
+    var manifest = cache.get(key);
+    if (!manifest) return null;
+
+    var parts = String(manifest).split('|');
+    var count = Number(parts[0]);
+    var stamp = parts[1];
+    if (!stamp || !(count > 0)) return null;
+
+    var keys = [];
+    for (var c = 0; c < count; c++) keys.push(key + '.' + stamp + '.' + c);
+    var got = cache.getAll(keys);
+
+    var json = '';
+    for (var i = 0; i < keys.length; i++) {
+      var piece = got[keys[i]];
+      if (piece === null || piece === undefined) return null;   // evicted mid-set
+      json += piece;
+    }
+    return decodeRows_(JSON.parse(json));
+  } catch (err) {
+    console.warn('table cache read failed for ' + name + ': ' + err);
+    return null;
+  }
+}
+
+function cachePutTable_(name, rows, gen) {
+  try {
+    if (!gen) return;                          // generation unknown: do not cache
+    var json = JSON.stringify(encodeRows_(rows));
+    var count = Math.ceil(json.length / CACHE_CHUNK_CHARS) || 1;
+    if (count > CACHE_MAX_CHUNKS) return;      // too big to be worth the round-trips
+
+    var key = cacheKey_(name);
+    var stamp = Utilities.getUuid().replace(/-/g, '').substring(0, 8);
+    var map = {};
+    for (var c = 0; c < count; c++) {
+      map[key + '.' + stamp + '.' + c] = json.substring(c * CACHE_CHUNK_CHARS,
+                                                        (c + 1) * CACHE_CHUNK_CHARS);
+    }
+    var cache = CacheService.getScriptCache();
+    // Someone committed a write while we were reading the sheet, so what we are
+    // holding may already be out of date. Drop it rather than cache it.
+    if (cache.get(genKey_(name)) !== gen) return;
+
+    // Chunks first, manifest last: a reader that catches us mid-write finds no
+    // manifest and reads the sheet, rather than finding one that points at
+    // chunks which are not there yet.
+    cache.putAll(map, CACHE_TTL_SEC);
+    cache.put(key, count + '|' + stamp, CACHE_TTL_SEC);
+  } catch (err) {
+    console.warn('table cache write failed for ' + name + ': ' + err);
+  }
+}
+
+/**
+ * Drop a tab from the cache. Called after every write, inside the lock, so the
+ * next reader misses and reloads.
+ *
+ * Only the manifest is deleted. The orphaned chunks expire on their own and can
+ * never be read again, because the next write picks a fresh stamp.
+ */
+function invalidateTable_(name) {
+  delete TABLE_MEMO_[name];
+  if (name === TAB_CONFIG) CONFIG_CACHE = null;
+  try {
+    // Make the write durable FIRST. Apps Script buffers setValues, so dropping
+    // the key while the row is still pending would let the next reader load the
+    // sheet, miss the new row, and cache that for six hours.
+    SpreadsheetApp.flush();
+  } catch (err) {
+    console.error('flush before invalidate failed: ' + err);
+  }
+  try {
+    var cache = CacheService.getScriptCache();
+    cache.remove(cacheKey_(name));
+    // Bump the generation so an in-flight reader that started before this write
+    // discards what it read instead of caching it.
+    cache.put(genKey_(name), Utilities.getUuid(), CACHE_TTL_SEC);
+  } catch (err) {
+    console.warn('table cache invalidate failed for ' + name + ': ' + err);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,9 +1328,17 @@ function requirePin_(p) {
 /** Roster with per-student totals, all recomputed from the log. */
 function actionGetRoster_(p) {
   requirePin_(p);
-  var students = studentIndex_(readTable_(TAB_STUDENTS));
-  var byStudent = groupByStudent_(resolveEvents_(readTable_(TAB_EVENTS)));
   var includeInactive = p.include_inactive === undefined ? true : truthy_(p.include_inactive);
+
+  // The admin page needs four columns — id, name, grade, active — and derives
+  // every statistic from the timesheet it fetches anyway. Saying so lets us
+  // skip reading Events, resolving them and building every student's sessions
+  // for a payload that would be thrown away. The tablet's roster prime still
+  // wants currently_in, so it does not pass this and gets the full shape.
+  var slim = truthy_(p.slim);
+
+  var students = studentIndex_(readTable_(TAB_STUDENTS));
+  var byStudent = slim ? null : groupByStudent_(resolveEvents_(readTable_(TAB_EVENTS)));
 
   var roster = [];
   var inLab = 0;
@@ -1120,14 +1346,17 @@ function actionGetRoster_(p) {
     if (!students.hasOwnProperty(sid)) continue;
     var s = students[sid];
     if (!s.active && !includeInactive) continue;
-    var events = byStudent[sid] || [];
-    var stats = summarize_(buildSessions_(events));
-    var last = events.length ? events[events.length - 1] : null;
-    if (s.active && stats.currently_in) inLab++;
-    var entry = publicStudent_(s);
-    for (var k in stats) if (stats.hasOwnProperty(k)) entry[k] = stats[k];
-    entry.last_event = last ? { timestamp: last.timestamp, direction: last.direction,
-                                source: last.source, flagged: last.flagged } : null;
+    // Four columns in slim mode, literally: created_at is on the record but no
+    // view has ever drawn it.
+    var entry = slim
+      ? { student_id: s.student_id, name: s.name, grade: s.grade, active: s.active }
+      : publicStudent_(s);
+    if (!slim) {
+      var events = byStudent[sid] || [];
+      var stats = summarize_(buildSessions_(events));
+      if (s.active && stats.currently_in) inLab++;
+      for (var k in stats) if (stats.hasOwnProperty(k)) entry[k] = stats[k];
+    }
     roster.push(entry);
   }
   roster.sort(function (a, b) { return a.name.localeCompare(b.name); });
@@ -1135,7 +1364,7 @@ function actionGetRoster_(p) {
   return ok_({
     students: roster,
     count: roster.length,
-    currently_in_lab: inLab,
+    currently_in_lab: slim ? null : inLab,
     generated_at: nowIso_()
   });
 }
@@ -1151,6 +1380,9 @@ function actionGetTimesheet_(p) {
   if (from && !/^\d{4}-\d{2}-\d{2}$/.test(from)) fail_('from must be YYYY-MM-DD');
   if (to && !/^\d{4}-\d{2}-\d{2}$/.test(to)) fail_('to must be YYYY-MM-DD');
   var onlyStudent = p.student_id ? requireId_(p.student_id) : null;
+  // Opt-in, so an older deployed page that has not asked for it keeps getting
+  // the full shape. The admin page asks.
+  var slim = truthy_(p.slim);
 
   var students = studentIndex_(readTable_(TAB_STUDENTS));
   var byStudent = groupByStudent_(resolveEvents_(readTable_(TAB_EVENTS)));
@@ -1168,11 +1400,19 @@ function actionGetTimesheet_(p) {
       if (from && s.date < from) continue;
       if (to && s.date > to) continue;
       s.name = student ? student.name : '(not on roster)';
-      s.grade = student ? student.grade : '';
+      if (slim) {
+        // The admin timesheet renders in_time/out_time itself and reads grade
+        // off the roster entry, so shipping a local-clock copy and a duplicate
+        // grade on every one of a season's sessions is dead weight.
+        delete s.in_clock;
+        delete s.out_clock;
+      } else {
+        s.grade = student ? student.grade : '';
+      }
       inRange.push(s);
       sessions.push(s);
     }
-    if (inRange.length) {
+    if (inRange.length && !slim) {
       var stats = summarize_(inRange);
       totals.push({
         student_id: sid,
@@ -1204,7 +1444,9 @@ function actionGetTimesheet_(p) {
     from: from || null,
     to: to || null,
     sessions: sessions,
-    totals_by_student: totals,
+    // Recomputed client-side in slim mode — it is a group-by over rows the
+    // client already has, not something worth a second copy on the wire.
+    totals_by_student: slim ? [] : totals,
     total_minutes: grandMinutes,
     total_hours: Math.round(grandMinutes / 6) / 10,
     flagged_sessions: flagged,
@@ -1268,6 +1510,34 @@ function actionGetStudent_(p) {
  * Takes event_id plus at least one of timestamp (ISO or YYYY-MM-DD HH:mm) and
  * direction, plus an optional reason.
  */
+/**
+ * One student's sessions, rebuilt from the log the caller already has in hand.
+ *
+ * editEvent and deleteEvent both append a row and then owe the admin page an
+ * answer precise enough that it never has to re-fetch. Returning just the new
+ * event would not be enough: superseding a check-in can re-pair the sessions
+ * around it, and only the server knows how. So they hand back this student's
+ * whole rebuilt timeline, computed in memory from `raw` plus the row just
+ * written — no second sheet read, and no guessing on the client.
+ */
+function studentSessionsAfter_(raw, appended, studentId) {
+  var live = resolveEvents_(raw.concat(appended));
+  var mine = groupByStudent_(live)[studentId] || [];
+  var sessions = buildSessions_(mine);
+  var students = studentIndex_(readTable_(TAB_STUDENTS));
+  var student = students[studentId];
+  var name = student ? student.name : '(not on roster)';
+  for (var i = 0; i < sessions.length; i++) {
+    sessions[i].name = name;
+    delete sessions[i].in_clock;    // matches the slim timesheet shape
+    delete sessions[i].out_clock;
+  }
+  sessions.sort(function (a, b) {
+    return a.in_time < b.in_time ? 1 : (a.in_time > b.in_time ? -1 : 0);   // newest first
+  });
+  return sessions;
+}
+
 function actionEditEvent_(p) {
   requirePin_(p);
   var targetId = requireStr_(p, 'event_id', 64);
@@ -1305,7 +1575,9 @@ function actionEditEvent_(p) {
     return ok_({
       corrected: { event_id: target.event_id, timestamp: target.timestamp, direction: target.direction },
       replacement: ev,
-      student_id: target.student_id
+      student_id: target.student_id,
+      // Everything the admin page needs to patch its state without re-reading.
+      sessions: studentSessionsAfter_(raw, [ev], target.student_id)
     });
   });
 }
@@ -1346,7 +1618,8 @@ function actionDeleteEvent_(p) {
     return ok_({
       voided: { event_id: target.event_id, timestamp: target.timestamp, direction: target.direction },
       tombstone_id: ev.event_id,
-      student_id: target.student_id
+      student_id: target.student_id,
+      sessions: studentSessionsAfter_(raw, [ev], target.student_id)
     });
   });
 }
@@ -1487,7 +1760,14 @@ function actionSetActive_(p) {
     if (!student) fail_('no student with id ' + studentId);
     // Column 4 is `active` — see HEADERS[Students]; column order is the contract.
     sheet_(TAB_STUDENTS).getRange(student._row, 4).setValue(active);
-    return ok_({ student_id: studentId, name: student.name, active: active });
+    invalidateTable_(TAB_STUDENTS);      // an in-place write, so not via appendRows_
+
+    // The whole record, not just the field that moved. The admin page patches
+    // its local roster with this and never re-fetches, so anything it needs has
+    // to come back here.
+    student.active = active;
+    return ok_({ student_id: studentId, name: student.name, active: active,
+                 student: publicStudent_(student) });
   });
 }
 
@@ -1517,9 +1797,11 @@ function actionSetName_(p) {
     if (name !== previous) {
       // Column 2 is `name` — see HEADERS[Students]; column order is the contract.
       sheet_(TAB_STUDENTS).getRange(student._row, 2).setValue(name);
+      invalidateTable_(TAB_STUDENTS);    // an in-place write, so not via appendRows_
     }
+    student.name = name;
     return ok_({ student_id: studentId, name: name, previous_name: previous,
-                 changed: name !== previous });
+                 changed: name !== previous, student: publicStudent_(student) });
   });
 }
 

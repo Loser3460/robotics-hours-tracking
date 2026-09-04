@@ -28,11 +28,17 @@
     transform: scaleX(-1);
   }
 
-  /* ---- aiming reticle ---- */
+  /* ---- aiming reticle ----
+     This box is not decoration: it is drawn exactly over the region the
+     scanner decodes. js/scanner.js crops to a centred square covering 60% of
+     the preview's short edge (its `roi` option), and because the preview is
+     `object-fit: cover` and fills the viewport, that region is 60vmin on
+     screen — centred, with no vertical nudge. If `roi` ever changes, change
+     this to match or the box starts lying about where to hold the card. */
   .reticle {
     position: fixed; top: 50%; left: 50%;
-    width: min(52vmin, 30rem); height: min(52vmin, 30rem);
-    transform: translate(-50%, -54%);
+    width: 60vmin; height: 60vmin;
+    transform: translate(-50%, -50%);
     border-radius: 2rem;
     box-shadow: 0 0 0 100vmax rgba(0, 0, 0, 0.45);
     pointer-events: none;
@@ -605,7 +611,8 @@ async function primeRoster() {
   msg.removeAttribute('data-tone');
   msg.textContent = 'Loading…';
   try {
-    const data = await api.admin.getRoster(pin, { timeoutMs: 30000 });
+    // Not slim: the prime needs currently_in and current_session_since.
+    const data = await api.admin.getRoster(pin, {}, { timeoutMs: 30000 });
     for (const s of data.students) {
       students.remember(s.student_id, {
         name: s.name,

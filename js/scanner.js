@@ -10,11 +10,19 @@
  *   await scanner.start();     // throws CameraError if the camera is unusable
  *   scanner.stop();            // ALWAYS call this — see the note on stop()
  *
- * Two decisions worth keeping:
+ * Three decisions worth keeping:
  *
  * QR only. The detector is restricted to 'qr_code'. Asking for linear formats
  * as well makes every frame more expensive on a tablet that is already running
  * a live camera preview, and the cards are QR.
+ *
+ * Decode a small centred crop, not the frame. The camera is opened at 720p,
+ * and on the jsQR path each attempt reads only the middle 60% of the visible
+ * preview, downscaled — a ~288px square rather than a 1280x720 one. That is
+ * roughly 25ms per attempt instead of 130ms, which is what turns "hold the
+ * card still" into "it reads as you bring it up". The price is that a card
+ * outside the crop is not seen at all, so the page MUST draw a box over the
+ * region: roiScreenSize() gives its size, and index.html's reticle is it.
  *
  * The callback only ever fires for a valid payload. A QR code that is not a
  * bare 7-digit number is dropped silently, with no callback and no error —
@@ -43,13 +51,31 @@ import { isValidStudentId } from './api.js';
 const JSQR_URL = new URL('./vendor/jsqr.js', import.meta.url).href;
 
 const DEFAULTS = {
-  decodeIntervalMs: 120,     // ~8 looks per second; faster only burns battery
+  // ~16 looks per second. This used to be 120ms, which was moot when an
+  // attempt itself took longer than that; now that an attempt is ~25ms the
+  // interval is the thing setting how fast a card is picked up, and at 60ms
+  // the loop is still idle three quarters of the time.
+  decodeIntervalMs: 60,
   repeatLockoutMs: 6000,     // ignore the same card sitting in frame
   // Rear camera by default, which is right for a hand-held phone pointing at a
   // card. The wall tablet overrides this with 'user' — see index.html.
   facingMode: 'environment',
-  jsqrWidth: 480,            // downscale before software decoding
+  jsqrWidth: 480,            // downscale the frame to this long edge before decoding
+  // Fraction of the visible short edge that is actually decoded. jsQR only ever
+  // sees this centred square, so the on-screen alignment box MUST match it —
+  // see roiScreenSize() and the reticle in index.html.
+  roi: 0.6,
+  // Ask for 720p rather than whatever the camera can do. We are decoding, not
+  // recording: a 1080p or 4K stream costs the same decode after downscaling but
+  // makes the browser move several times as many bytes per frame.
+  width: 1280,
+  height: 720,
+  feedback: true,            // beep + vibrate on a successful scan
 };
+
+// How many decode timings to keep for the rolling stats. One page-load's worth
+// of scans is plenty to spot a regression.
+const STAT_WINDOW = 120;
 
 /** A camera that could not be opened. `kind` lets the page choose its wording. */
 export class CameraError extends Error {
@@ -87,6 +113,98 @@ function loadJsQr() {
 }
 
 /**
+ * The part of the video frame the student can actually see.
+ *
+ * Both pages show the preview with `object-fit: cover`, so the browser scales
+ * the frame up until it fills the element and throws away the overflow on one
+ * axis. Decoding a region the student cannot see is worse than useless: they
+ * would be aiming at a box that does not correspond to what jsQR is reading.
+ */
+function visibleRect(video) {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const ew = video.clientWidth || vw, eh = video.clientHeight || vh;
+  const scale = Math.max(ew / vw, eh / vh);        // object-fit: cover
+  const w = Math.min(vw, ew / scale);
+  const h = Math.min(vh, eh / scale);
+  return { x: (vw - w) / 2, y: (vh - h) / 2, w, h, scale };
+}
+
+/**
+ * The centred square, in video pixels, that we hand to jsQR.
+ *
+ * Sized off the *visible* rect rather than the raw frame so the region is
+ * always fully on screen, which is what lets the reticle be honest: the box
+ * the student aims at is exactly the pixels being decoded.
+ */
+function roiRect(video, fraction) {
+  const vis = visibleRect(video);
+  const side = Math.min(vis.w, vis.h) * fraction;
+  return {
+    x: video.videoWidth / 2 - side / 2,
+    y: video.videoHeight / 2 - side / 2,
+    side,
+    scale: vis.scale,
+  };
+}
+
+/**
+ * Scan feedback: a short beep and a buzz.
+ *
+ * The point is to end the hover. Without it a student has no idea whether the
+ * scan landed, so they keep the card in frame and inch it around, which is
+ * both the thing they complain about and the thing that keeps the decode loop
+ * busy. The confirmation sheet appears a network round-trip later; this fires
+ * the instant the code is read.
+ */
+let audioCtx = null;
+let audioUnlocked = false;
+
+/**
+ * iOS starts an AudioContext suspended and will only resume it inside a user
+ * gesture. The tablet boots the scanner with no gesture at all, so arm it on
+ * the first touch the kiosk ever gets and keep it for the rest of the day.
+ */
+function unlockAudioOnFirstGesture() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  const unlock = () => {
+    try { audioCtx?.resume(); } catch { /* nothing to resume */ }
+  };
+  for (const evt of ['pointerdown', 'touchend', 'keydown']) {
+    window.addEventListener(evt, unlock, { once: true, passive: true });
+  }
+}
+
+function beep() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!audioCtx) audioCtx = new Ctx();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const now = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(1080, now);
+    // Ramped, not switched: a square-edged gate on a sine clicks on the iPad.
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.28, now + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(now);
+    osc.stop(now + 0.15);
+  } catch (err) {
+    console.warn('scanner: could not beep', err);   // never block a scan on audio
+  }
+}
+
+function buzz() {
+  // Android only — iOS Safari has no Vibration API, which is why the beep
+  // carries the feedback on the tablet and this is a bonus on phones.
+  try { navigator.vibrate?.(60); } catch { /* not supported */ }
+}
+
+/**
  * Native BarcodeDetector where it exists, jsQR everywhere else.
  * iPad Safari has no BarcodeDetector at all, which is the case that matters
  * most here — the lab tablet is an iPad.
@@ -98,6 +216,11 @@ async function buildDetector(video, opts) {
       if (formats.includes('qr_code')) {
         const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
         console.info('scanner: using native BarcodeDetector');
+        // Handed the <video> directly: the native path is hardware-backed, so
+        // cropping and downscaling in JS first would cost more than it saves.
+        // It therefore reads the whole frame while the reticle marks only the
+        // middle — a card inside the box still works, it is just not the only
+        // place that works. That asymmetry is fine; the box is guidance.
         return async () => {
           const codes = await detector.detect(video);
           return codes.length ? codes[0].rawValue : null;
@@ -110,18 +233,38 @@ async function buildDetector(video, opts) {
 
   const jsQR = await loadJsQr();
   console.info('scanner: using jsQR fallback');
+
+  // One reusable canvas, sized once. jsQR is pure JavaScript and its cost is
+  // linear in pixels, so what we hand it is the whole optimisation:
+  //
+  //   full 1280x720 frame          ~810 ms per attempt
+  //   downscaled to 480 long edge  ~130 ms
+  //   + cropped to the 60% reticle  ~25 ms
+  //
+  // At 25 ms a decode fits inside one 60 Hz frame's budget several times over,
+  // which is the difference between "hold it still for a few seconds" and
+  // "it reads as you bring the card up".
   const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const ctx = canvas.getContext('2d', { willReadFrequently: true, alpha: false });
+
   return () => {
     if (!video.videoWidth) return null;
-    // jsQR is pure JavaScript; decoding a full 1280x720 frame every tick heats up
-    // an older phone or iPad for no gain on a card held at the reticle.
-    const scale = Math.min(1, opts.jsqrWidth / video.videoWidth);
-    canvas.width = Math.round(video.videoWidth * scale);
-    canvas.height = Math.round(video.videoHeight * scale);
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const code = jsQR(image.data, image.width, image.height, { inversionAttempts: 'dontInvert' });
+    const roi = roiRect(video, opts.roi);
+    if (roi.side < 1) return null;
+
+    // The decode buffer: the reticle square, at the resolution it would have
+    // had in a frame downscaled to jsqrWidth. Never upscale — a blurry card
+    // does not get sharper, it just costs more pixels.
+    const side = Math.max(1, Math.round(Math.min(roi.side, opts.jsqrWidth * opts.roi)));
+    if (canvas.width !== side) { canvas.width = side; canvas.height = side; }
+
+    // NOTE: drawImage reads the raw frame. The tablet's preview is mirrored,
+    // but that mirroring is a CSS transform on the <video> element and CSS
+    // never touches the pixels the canvas gets. Do not "match" it here — a
+    // mirrored QR code does not decode at all.
+    ctx.drawImage(video, roi.x, roi.y, roi.side, roi.side, 0, 0, side, side);
+    const image = ctx.getImageData(0, 0, side, side);
+    const code = jsQR(image.data, side, side, { inversionAttempts: 'dontInvert' });
     return code ? code.data : null;
   };
 }
@@ -148,6 +291,33 @@ export function createScanner(video, onCode, options = {}) {
   let lastCode = null;
   let lastCodeAt = 0;
 
+  // Rolling decode timings, so a regression here is measurable rather than a
+  // matter of opinion. See the stats getter.
+  let attempts = 0;
+  let attemptsSinceHit = 0;
+  let hits = 0;
+  const timings = [];
+
+  function record(ms) {
+    attempts += 1;
+    attemptsSinceHit += 1;
+    timings.push(ms);
+    if (timings.length > STAT_WINDOW) timings.shift();
+  }
+
+  function percentile(sorted, q) {
+    if (!sorted.length) return 0;
+    return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+  }
+
+  /**
+   * One decode attempt per animation frame at most, and never two at once.
+   *
+   * `decoding` is the important guard. The native detector is async and jsQR
+   * can overrun the interval on a slow tablet; without it, attempts pile up
+   * behind each other and every one of them is reading a stale frame by the
+   * time it runs, so the loop gets slower exactly when it is already behind.
+   */
   function tick(timestamp) {
     if (!running) return;
     frame = requestAnimationFrame(tick);
@@ -156,10 +326,17 @@ export function createScanner(video, onCode, options = {}) {
     lastDecodeAt = timestamp;
 
     decoding = true;
+    const started = performance.now();
     Promise.resolve()
       .then(detect)
-      .then((raw) => { if (raw != null) handle(raw); })
-      .catch((err) => console.warn('scanner: decode failed', err))
+      .then((raw) => {
+        record(performance.now() - started);
+        if (raw != null) handle(raw);
+      })
+      .catch((err) => {
+        record(performance.now() - started);
+        console.warn('scanner: decode failed', err);
+      })
       .finally(() => { decoding = false; });
   }
 
@@ -171,12 +348,37 @@ export function createScanner(video, onCode, options = {}) {
     if (value === lastCode && now - lastCodeAt < opts.repeatLockoutMs) return;
     lastCode = value;
     lastCodeAt = now;
+    hits += 1;
+
+    // Before the callback, so the confirmation is instant even though the
+    // scan itself still has a network round-trip ahead of it.
+    if (opts.feedback) { beep(); buzz(); }
+
+    const s = stats();
+    console.info(`scanner: read a card after ${attemptsSinceHit} attempt(s) — ` +
+      `median ${s.medianMs.toFixed(1)}ms, p95 ${s.p95Ms.toFixed(1)}ms per attempt ` +
+      `over the last ${s.samples}`);
+    attemptsSinceHit = 0;
 
     try {
       onCode(value);
     } catch (err) {
       console.error('scanner: callback threw', err);  // never let it kill the loop
     }
+  }
+
+  /** Rolling decode-cost summary. Cheap to call; safe before start(). */
+  function stats() {
+    const sorted = [...timings].sort((a, b) => a - b);
+    return {
+      attempts,
+      attemptsSinceHit,
+      hits,
+      samples: sorted.length,
+      lastMs: timings.length ? timings[timings.length - 1] : 0,
+      medianMs: percentile(sorted, 0.5),
+      p95Ms: percentile(sorted, 0.95),
+    };
   }
 
   async function start() {
@@ -192,11 +394,17 @@ export function createScanner(video, onCode, options = {}) {
     }
 
     try {
+      // Ask for 720p explicitly rather than letting the device pick. Left to
+      // itself an iPad hands back the sensor's full resolution, and every one
+      // of those extra pixels is copied per frame for a decode that throws all
+      // of them away. `ideal` rather than `exact` so a camera that cannot do
+      // 720p still opens instead of throwing OverconstrainedError.
       stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: opts.facingMode },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: opts.width },
+          height: { ideal: opts.height },
+          frameRate: { ideal: 30 },
         },
         audio: false,
       });
@@ -215,6 +423,8 @@ export function createScanner(video, onCode, options = {}) {
       stop();                                   // never leave the light on after a failed start
       throw err instanceof CameraError ? err : new CameraError(err.message, 'other');
     }
+
+    if (opts.feedback) unlockAudioOnFirstGesture();
 
     running = true;
     paused = false;
@@ -254,5 +464,17 @@ export function createScanner(video, onCode, options = {}) {
     clearLockout() { lastCode = null; lastCodeAt = 0; },
     get running() { return running; },
     get paused() { return paused; },
+    /**
+     * Side of the decoded region in CSS pixels, for drawing an alignment box
+     * that matches it. Under `object-fit: cover` the visible short edge always
+     * maps to the element's short edge, so this reduces to a fraction of the
+     * element — but ask rather than hard-coding it, so the box follows the ROI
+     * if it is ever retuned.
+     */
+    roiScreenSize() {
+      return opts.roi * Math.min(video.clientWidth, video.clientHeight);
+    },
+    /** Rolling decode timings — {attempts, hits, samples, lastMs, medianMs, p95Ms}. */
+    get stats() { return stats(); },
   };
 }

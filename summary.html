@@ -49,9 +49,11 @@
     border-radius: 0.75rem; overflow: hidden; background: #000;
   }
   .video-frame video { width: 100%; height: 100%; object-fit: cover; }
+  /* Sized to the region js/scanner.js actually decodes: 60% of the preview's
+     SHORT edge, which in this 4:3 frame is the height, not the width. */
   .video-frame__reticle {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    width: 58%; aspect-ratio: 1; border: 3px solid rgba(255,255,255,0.85); border-radius: 0.75rem;
+    height: 60%; aspect-ratio: 1; border: 3px solid rgba(255,255,255,0.85); border-radius: 0.75rem;
   }
 
   /* identity confirmation */
