@@ -82,41 +82,50 @@
   .badge--offline { background: var(--error); }
   .dot { width: 0.8em; height: 0.8em; border-radius: 50%; background: currentColor; }
 
-  /* ---- full-screen result overlay ---- */
-  .overlay {
-    position: fixed; inset: 0; z-index: 10;
-    display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    gap: 2vmin; padding: 6vmin;
-    text-align: center;
-    background: var(--bg-raised);
-    animation: overlay-in 160ms ease-out;
-  }
-  @keyframes overlay-in { from { opacity: 0; } to { opacity: 1; } }
-  .overlay[data-tone="in"]      { background: var(--in); }
-  .overlay[data-tone="out"]     { background: var(--out); }
-  .overlay[data-tone="warn"]    { background: var(--warn); }
-  .overlay[data-tone="error"]   { background: var(--error); }
-  .overlay[data-tone="neutral"] { background: var(--bg-raised); }
+  /* ---- confirmation toasts ----
+     These used to be a full-screen card, which meant one student at a time:
+     it covered the camera AND paused the decoder, so the next card could not
+     even be read until the previous student's four seconds were up. A whole
+     team leaving at once queued up at the tablet.
 
-  .overlay__kicker { font-size: var(--step-lg); font-weight: 700; opacity: 0.85; margin: 0; }
-  .overlay__name {
-    margin: 0; font-size: var(--step-hero); font-weight: 800; line-height: 1.05;
-    overflow-wrap: anywhere;
+     Everything a scan says now lives in a small stack in the top corner,
+     clear of the reticle, while the camera keeps decoding underneath. That
+     is a hard constraint on this block: nothing here may grow into the
+     centre 60vmin the student holds their card in, and nothing here may take
+     pointer events away from it. */
+  .toasts {
+    position: fixed; z-index: 10;
+    top: calc(env(safe-area-inset-top, 0px) + 5.5rem);
+    right: 1.5rem;
+    width: min(42vw, 26rem);
+    display: flex; flex-direction: column; gap: 0.75rem;
+    pointer-events: none;              /* the camera view stays tappable */
   }
-  .overlay__detail { margin: 0; font-size: var(--step-xl); font-weight: 700; }
-  .overlay__note {
-    margin: 2vmin 0 0; font-size: var(--step-md); font-weight: 600;
-    padding: 0.5em 1em; border-radius: 999px;
-    background: rgba(0, 0, 0, 0.3);
+  .toast {
+    pointer-events: auto;              /* ...but a toast can be dismissed */
+    padding: 1rem 1.25rem;
+    border-radius: var(--radius);
+    background: var(--bg-raised);
+    box-shadow: 0 0.5rem 2rem rgba(0, 0, 0, 0.55);
+    animation: toast-in 140ms ease-out;
   }
-  /* Progress bar showing how long the confirmation stays up. */
-  .overlay__timer {
-    position: absolute; left: 0; bottom: 0; height: 0.75rem;
-    background: rgba(255, 255, 255, 0.7);
-    animation: drain var(--hold, 4000ms) linear forwards;
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(-0.6rem); }
+    to   { opacity: 1; transform: none; }
   }
-  @keyframes drain { from { width: 100%; } to { width: 0%; } }
+  .toast[data-tone="pending"] { background: #39414d; }   /* grey — still asking the server */
+  .toast[data-tone="in"]      { background: var(--in); }
+  .toast[data-tone="out"]     { background: var(--out); }
+  .toast[data-tone="warn"]    { background: var(--warn); }
+  .toast[data-tone="error"]   { background: var(--error); }
+
+  .toast__kicker { margin: 0; font-size: var(--step-sm); font-weight: 700; opacity: 0.85; }
+  .toast__name {
+    margin: 0.1em 0 0; font-size: var(--step-lg); font-weight: 800;
+    line-height: 1.1; overflow-wrap: anywhere;
+  }
+  .toast__detail { margin: 0.25em 0 0; font-size: var(--step-md); font-weight: 700; }
+  .toast__note   { margin: 0.5em 0 0; font-size: var(--step-sm); font-weight: 600; opacity: 0.9; }
 
   /* ---- sheets (enrollment, PIN, fatal error) ---- */
   .sheet {
@@ -157,14 +166,8 @@
     <span class="badge badge--offline" id="offline-badge" hidden><span class="dot"></span> Offline</span>
   </header>
 
-  <!-- Full-screen confirmation -->
-  <div class="overlay" id="overlay" role="status" aria-live="assertive" hidden>
-    <p class="overlay__kicker" id="ov-kicker"></p>
-    <p class="overlay__name"   id="ov-name"></p>
-    <p class="overlay__detail" id="ov-detail"></p>
-    <p class="overlay__note"   id="ov-note" hidden></p>
-    <div class="overlay__timer" id="ov-timer"></div>
-  </div>
+  <!-- Confirmations. Corner stack, one per scan, camera never blocked. -->
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
   <!-- Enrollment for an unrecognised card.
 
@@ -222,6 +225,8 @@ import { createScanner, CameraError } from './js/scanner.js';
 
 const HOLD_MS            = 4000;   // how long a confirmation stays up
 const BRIEF_MS           = 1800;   // for minor notices
+const ERROR_HOLD_MS      = 9000;   // errors outlive the next few students
+const MAX_TOASTS         = 4;      // more than this and the corner is a wall
 const SYNC_INTERVAL_MS   = 60000;  // background retry of the offline queue
 const MAX_QUEUE          = 500;    // beyond this, something is broken, not slow
 
@@ -234,7 +239,7 @@ const KEY_STUDENTS = 'lab.students';
 
 const $ = (id) => document.getElementById(id);
 const video = $('video');
-const overlay = $('overlay');
+const toasts = $('toasts');
 
 // ---------------------------------------------------------------------------
 // Local storage: the student name cache and the offline queue
@@ -308,39 +313,77 @@ function tickClock() {
 // Screens
 // ---------------------------------------------------------------------------
 
-let holdTimer = null;
 let scanner = null;             // set once the camera is live
 
-function showOverlay({ tone, kicker, name, detail, note, hold = HOLD_MS }) {
-  clearTimeout(holdTimer);
-  overlay.dataset.tone = tone;
-  $('ov-kicker').textContent = kicker || '';
-  $('ov-name').textContent = name || '';
-  $('ov-detail').textContent = detail || '';
-  $('ov-note').textContent = note || '';
-  $('ov-note').hidden = !note;
-  overlay.style.setProperty('--hold', hold + 'ms');
-  // Restart the CSS drain animation.
-  const timer = $('ov-timer');
-  timer.style.animation = 'none';
-  void timer.offsetWidth;
-  timer.style.animation = '';
-  overlay.hidden = false;
-  scanner?.pause();             // keep the stream open, stop looking at frames
-  holdTimer = setTimeout(resumeScanning, hold);
+/**
+ * One confirmation. Returns a handle rather than drawing and forgetting,
+ * because a scan is two moments — "checking in" the instant the card is read,
+ * then the server's answer a second or two later — and both belong to the same
+ * student. The handle lets the second overwrite the first in place, so a toast
+ * never has to be matched back to a student by position in the stack.
+ *
+ * `hold: 0` pins a toast open; it stays until the caller updates or drops it.
+ */
+function pushToast(initial) {
+  const el = document.createElement('div');
+  el.className = 'toast';
+  const kicker = document.createElement('p'); kicker.className = 'toast__kicker';
+  const name   = document.createElement('p'); name.className   = 'toast__name';
+  const detail = document.createElement('p'); detail.className = 'toast__detail';
+  const note   = document.createElement('p'); note.className   = 'toast__note';
+  el.append(kicker, name, detail, note);
+  el.addEventListener('click', dismiss);
+
+  let timer = null;
+
+  function dismiss() {
+    clearTimeout(timer);
+    el.remove();
+  }
+
+  // textContent everywhere: a name comes back from the sheet, and a roster a
+  // student typed into is not a place to start trusting markup.
+  function update(next) {
+    clearTimeout(timer);
+    el.dataset.tone = next.tone || 'pending';
+    kicker.textContent = next.kicker || '';
+    name.textContent = next.name || '';
+    detail.textContent = next.detail || '';
+    detail.hidden = !next.detail;
+    note.textContent = next.note || '';
+    note.hidden = !next.note;
+    const hold = next.hold === undefined ? HOLD_MS : next.hold;
+    if (hold > 0) timer = setTimeout(dismiss, hold);
+  }
+
+  update(initial);
+  toasts.prepend(el);            // newest nearest the status bar
+  trimToasts();
+  return { update, dismiss };
 }
 
-function resumeScanning() {
-  clearTimeout(holdTimer);
-  overlay.hidden = true;
+/**
+ * Cap the stack. Settled toasts go first: one that is still grey is a student
+ * who has not been told anything yet, and dropping it would leave them with no
+ * answer at all. Only when every toast is still waiting does the oldest go.
+ */
+function trimToasts() {
+  while (toasts.children.length > MAX_TOASTS) {
+    const list = [...toasts.children];
+    const victim = list.reverse().find((el) => el.dataset.tone !== 'pending') || list[0];
+    victim.remove();
+  }
+}
+
+/** A one-off notice with no server round-trip behind it. */
+function toast(opts) { return pushToast(opts); }
+
+/** Close whatever sheet is open and start looking at frames again. */
+function closeSheets() {
   $('enroll-sheet').hidden = true;
   $('pin-sheet').hidden = true;
   scanner?.resume();
 }
-
-// Tapping a confirmation dismisses it early — a queue at the door should not
-// wait out the full four seconds.
-overlay.addEventListener('click', resumeScanning);
 
 function showFatal(title, message) {
   scanner?.stop();              // release the camera; nothing can be scanned now
@@ -364,48 +407,79 @@ function formatDuration(minutes) {
 // js/scanner.js owns the camera and the decode loop. It only calls back for a
 // validated 7-digit payload and it swallows repeats of the same card, so
 // everything below is about what to DO with a scan.
+//
+// Nothing here pauses the scanner. Students arrive in a clump — a whole
+// subteam leaving at nine o'clock — and the tablet has to take card after card
+// without anyone waiting for the person in front of them to finish. So a scan
+// draws its toast and hands off; the camera is still decoding while the
+// request is in the air.
+//
+// Two things keep that from turning into a mess:
+//
+//  - `inFlight` refuses a second scan of a card that is already mid-request.
+//    The decoder's own 6s repeat lockout usually covers this, but a slow
+//    round-trip can outlast it, and a double IN/OUT pair is a corrupted
+//    session, not a cosmetic glitch.
+//  - `chain` sends the requests one at a time. The backend takes a script lock
+//    per scan anyway, so firing ten at once only converts them into ten
+//    fighting over the same lock; queued locally they simply arrive in the
+//    order the cards were read. The UI is not waiting on this — the student
+//    already has their grey toast — so a short wait costs nothing visible.
 // ---------------------------------------------------------------------------
 
-async function handleScan(studentId) {
-  scanner?.pause();
-  const known = students.get(studentId);
+const inFlight = new Set();
+let chain = Promise.resolve();
 
-  // Apps Script takes a second or two. Say something immediately, using the
-  // cached name when we have one, so nobody waves their card again.
-  showOverlay({
-    tone: 'neutral',
+function handleScan(studentId) {
+  if (inFlight.has(studentId)) return;      // same card, still being written
+  inFlight.add(studentId);
+
+  const known = students.get(studentId);
+  // Say something in the same frame the card was read, using the cached name
+  // when we have one, so nobody waves their card again. Pinned open (hold: 0)
+  // until the server answers.
+  const t = pushToast({
+    tone: 'pending',
     kicker: known ? 'Checking in' : 'Reading card',
     name: known ? known.name : studentId,
-    hold: 20000,
+    hold: 0,
   });
 
+  chain = chain
+    .then(() => sendScan(studentId, known, t))
+    .catch((err) => console.error('scan handling failed', err))
+    .finally(() => inFlight.delete(studentId));
+}
+
+async function sendScan(studentId, known, t) {
   let result;
   try {
     result = await api.scan(studentId);
   } catch (err) {
     // Queue only what is worth sending again. A wrong URL or a rejected scan
     // must show an error, not a green "saved, will sync" that never does.
-    if (err instanceof ApiError && err.isRetryable) return queueScan(studentId, known);
-    return showOverlay({
+    if (err instanceof ApiError && err.isRetryable) return queueScan(studentId, known, t);
+    return t.update({
       tone: 'error',
       kicker: 'Something went wrong',
       name: known ? known.name : studentId,
       detail: err.message,
       note: 'Tell a coach',
+      hold: ERROR_HOLD_MS,
     });
   }
 
-  if (result.status === 'unknown')   return openEnrollment(studentId);
-  if (result.status === 'inactive')  return showOverlay({
+  if (result.status === 'unknown')   return openEnrollment(studentId, t);
+  if (result.status === 'inactive')  return t.update({
     tone: 'error', kicker: 'Card not active', name: result.name || studentId,
-    detail: 'See a coach to reactivate it',
+    detail: 'See a coach to reactivate it', hold: ERROR_HOLD_MS,
   });
-  if (result.status === 'debounced') return showOverlay({
-    tone: 'neutral', kicker: 'Already scanned', name: result.name,
+  if (result.status === 'debounced') return t.update({
+    tone: 'pending', kicker: 'Already scanned', name: result.name,
     detail: 'Just a moment ago', hold: BRIEF_MS,
   });
 
-  celebrate(result);
+  celebrate(result, t);
   students.remember(studentId, {
     name: result.name,
     direction: result.direction,
@@ -416,17 +490,12 @@ async function handleScan(studentId) {
   syncQueue();
 }
 
-function celebrate(result) {
-  if (result.direction === 'in') {
-    showOverlay({ tone: 'in', kicker: 'Welcome,', name: result.name, detail: "You're checked in" });
-  } else {
-    showOverlay({
-      tone: 'out',
-      kicker: 'Goodbye,',
-      name: result.name,
-      detail: formatDuration(result.duration_minutes),
-    });
-  }
+/** @param {object} [t]  an existing toast to overwrite; a new one if omitted. */
+function celebrate(result, t) {
+  const shown = result.direction === 'in'
+    ? { tone: 'in',  kicker: 'Welcome,', name: result.name, detail: "You're checked in" }
+    : { tone: 'out', kicker: 'Goodbye,', name: result.name, detail: formatDuration(result.duration_minutes) };
+  return t ? t.update(shown) : pushToast(shown);
 }
 
 // ---------------------------------------------------------------------------
@@ -438,14 +507,15 @@ function celebrate(result) {
  * server writes these as flagged/unverified — which is the whole reason it
  * refuses client timestamps in every other case.
  */
-function queueScan(studentId, known) {
+function queueScan(studentId, known, t) {
   if (queue.length >= MAX_QUEUE) {
-    return showOverlay({
+    return t.update({
       tone: 'error',
       kicker: 'Not saved',
       name: (known && known.name) || studentId,
       detail: 'This tablet has ' + queue.length + ' scans it cannot send',
       note: 'Tell a coach — do not keep scanning',
+      hold: ERROR_HOLD_MS,
     });
   }
   // Guess the direction from what this tablet last saw, so the student still
@@ -465,7 +535,7 @@ function queueScan(studentId, known) {
     since: direction === 'in' ? timestamp : null,
   });
 
-  showOverlay({
+  t.update({
     tone: direction === 'in' ? 'in' : 'out',
     kicker: direction === 'in' ? 'Welcome,' : 'Goodbye,',
     name: (known && known.name) || studentId,
@@ -519,9 +589,13 @@ async function syncQueue() {
 
 let enrollingId = null;
 
-function openEnrollment(studentId) {
-  clearTimeout(holdTimer);
-  overlay.hidden = true;
+/**
+ * The one thing that still stops the camera. Enrolling needs a keyboard and
+ * somebody's full attention, so scanning past it is not a feature — the next
+ * student's card would land in the name field.
+ */
+function openEnrollment(studentId, t) {
+  t?.dismiss();
   scanner?.pause();
   enrollingId = studentId;
   $('enroll-id').textContent = studentId;
@@ -561,37 +635,37 @@ async function saveEnrollment(skipEmail = false) {
     return;
   }
 
+  const id = enrollingId;
   $('enroll-save').disabled = true;
   $('enroll-skip').disabled = true;
   msg.removeAttribute('data-tone');
   msg.textContent = 'Saving…';
   try {
-    await api.enroll(enrollingId, name, '', email);
-    students.remember(enrollingId, { name });
-    $('enroll-sheet').hidden = true;
-    // Enrolling is not the same as arriving, so check them straight in.
-    const result = await api.scan(enrollingId);
-    if (result.status === 'ok') {
-      celebrate(result);
-      students.remember(enrollingId, { name: result.name, direction: result.direction, since: result.timestamp });
-    } else {
-      showOverlay({ tone: 'in', kicker: 'Welcome,', name, detail: "You're on the roster" });
-    }
+    await api.enroll(id, name, '', email);
   } catch (err) {
     msg.dataset.tone = 'error';
     msg.textContent = err instanceof ApiError && err.isNetwork
       ? 'No connection — a coach will need to add you when the internet is back.'
       : err.message;
-    $('enroll-sheet').hidden = false;
+    return;                       // sheet stays open, camera stays paused
   } finally {
     $('enroll-save').disabled = false;
     $('enroll-skip').disabled = false;
   }
+
+  // On the roster. Hand the tablet back to the queue *before* checking them in
+  // — typing a name is what needed the keyboard; the check-in behind it is an
+  // ordinary scan and belongs in the ordinary path, toast and all. Enrolling
+  // is not the same as arriving, so it still has to happen.
+  students.remember(id, { name });
+  enrollingId = null;
+  closeSheets();
+  handleScan(id);
 }
 
 $('enroll-save').addEventListener('click', () => saveEnrollment(false));
 $('enroll-skip').addEventListener('click', () => saveEnrollment(true));
-$('enroll-cancel').addEventListener('click', () => { enrollingId = null; resumeScanning(); });
+$('enroll-cancel').addEventListener('click', () => { enrollingId = null; closeSheets(); });
 $('enroll-name').addEventListener('keydown', (e) => {
   if (e.key === 'Enter') $('enroll-email').focus();
 });
@@ -659,9 +733,10 @@ async function primeRoster() {
       });
     }
     $('pin-input').value = '';                 // the PIN is never stored
-    showOverlay({
-      tone: 'neutral', kicker: 'Roster loaded',
-      name: data.students.length + ' students', hold: BRIEF_MS,
+    closeSheets();
+    toast({
+      tone: 'pending', kicker: 'Roster loaded',
+      name: data.students.length + ' students',
     });
   } catch (err) {
     msg.dataset.tone = 'error';
@@ -670,7 +745,7 @@ async function primeRoster() {
 }
 
 $('pin-save').addEventListener('click', primeRoster);
-$('pin-cancel').addEventListener('click', () => { $('pin-input').value = ''; resumeScanning(); });
+$('pin-cancel').addEventListener('click', () => { $('pin-input').value = ''; closeSheets(); });
 $('pin-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') primeRoster(); });
 
 // ---------------------------------------------------------------------------

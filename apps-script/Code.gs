@@ -3041,19 +3041,29 @@ function summaryEmail_(item, base) {
   var by = Utilities.formatDate(deadline, tz_(), 'EEEE, MMMM d') + ' at ' +
            Utilities.formatDate(deadline, tz_(), 'h:mm a');
 
+  var at = Utilities.formatDate(out, tz_(), 'h:mm a');
+
+  // Gmail collapses the part of a message that repeats what an earlier message
+  // in the same thread already said, behind a "..." nobody expands. Every one
+  // of these mails ended the same way, so from the second one on a student saw
+  // the text stop mid-sentence at "Lab time without a". Two things keep that
+  // from happening: the subject carries the scan-out time, so consecutive mails
+  // are not one thread at all, and the last lines of the body -- the deadline
+  // and the session stamp -- differ every time, so there is no identical tail
+  // left to collapse. Keep something session-specific last if this is reworded.
   var body =
     'Hi ' + first + ',\n\n' +
     'You logged ' + (dur ? dur : 'a session') + ' in the lab on ' + day + '.\n\n' +
     'Write up what you worked on here:\n' + link + '\n\n' +
-    'The link is yours — it already knows who you are, so there is nothing to type in.\n\n' +
-    'Please submit it by ' + by + '. Lab time without a summary does not count ' +
-    'toward your hours.\n\n' +
-    'If you submit late, your hours come back automatically as soon as the summary lands.\n\n' +
-    '— Robotics lab hours';
+    'The link is yours — it already knows who you are, so there is nothing to type in. ' +
+    'Lab time without a summary does not count toward your hours, and a late summary ' +
+    'brings them back automatically as soon as it lands.\n\n' +
+    'Please submit it by ' + by + '.\n\n' +
+    '— Robotics lab hours (scanned out ' + day + ' at ' + at + ')';
 
   return {
     to: item.to,
-    subject: 'Log your lab hours for ' + day,
+    subject: 'Log your lab hours — ' + day + ' at ' + at,
     body: body,
     name: 'Robotics Lab Hours'
   };
