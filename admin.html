@@ -306,6 +306,36 @@
   .detail-head h2 { margin: 0; font-size: 1.5rem; }
   .row-gap { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
   .add-form { display: flex; gap: 0.75rem; align-items: flex-end; flex-wrap: wrap; padding: 1rem; margin-bottom: 1rem; }
+  .email-cell { max-width: 15rem; }
+  .email-cell__value {
+    display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 0.875rem;
+  }
+  /* ---- Rejected hours ---- */
+  .reject-group { margin-bottom: 1rem; }
+  .reject-group__head {
+    display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+    padding: 0.7rem 1rem; border-bottom: 1px solid var(--border);
+  }
+  .reject-group__name { font-weight: 600; }
+  .reject-row {
+    display: grid; gap: 0.75rem; align-items: center; padding: 0.7rem 1rem;
+    grid-template-columns: auto 9rem 5rem 1fr auto;
+    border-bottom: 1px solid var(--border);
+  }
+  .reject-row:last-child { border-bottom: 0; }
+  .reject-row__reason { font-size: 0.875rem; color: var(--text-dim); }
+  .bulkbar {
+    position: sticky; top: 0; z-index: 5;
+    display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+    padding: 0.7rem 1rem; margin-bottom: 1rem;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--bg-raised);
+  }
+  @media (max-width: 720px) {
+    .reject-row { grid-template-columns: auto 1fr auto; }
+    .reject-row__reason { grid-column: 1 / -1; }
+  }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -333,6 +363,7 @@
       <button class="tab" id="tab-roster" role="tab" aria-selected="true">Roster</button>
       <button class="tab" id="tab-timesheet" role="tab" aria-selected="false">Timesheet</button>
       <button class="tab" id="tab-flagged" role="tab" aria-selected="false">Needs review<span class="tab__count" id="flag-count" hidden></span></button>
+      <button class="tab" id="tab-rejected" role="tab" aria-selected="false">Rejected hours<span class="tab__count" id="rejected-count" hidden></span></button>
     </div>
     <span class="topbar__spacer"></span>
     <!-- Unobtrusive on purpose. A write is in flight, the interface stays
@@ -376,12 +407,19 @@ const $ = (id) => document.getElementById(id);
 const state = {
   pin: sessionStorage.getItem('lab.admin.pin') || '',
   students: [],
+  // Sessions that COUNT: active and recovered. Rejected ones are kept apart in
+  // state.rejected rather than filtered at each call site, so every total,
+  // average, chart bucket and CSV column on this page is correct without
+  // knowing the rule exists. This split in load() is the one place it is
+  // applied — the mirror of resolveEvents_() on the server.
   sessions: [],
+  rejected: [],
+  gracePeriodHours: 24,
   byStudent: new Map(),
   summariesByStudent: new Map(),
   loadedAt: null,
   summariesError: null,
-  view: 'roster',          // 'roster' | 'timesheet' | 'detail'
+  view: 'roster',          // 'roster' | 'timesheet' | 'flagged' | 'rejected' | 'detail'
   detailId: null,
   search: '',
   from: '',
@@ -392,7 +430,10 @@ const state = {
   editing: null,           // session key being edited
   confirming: null,        // session key awaiting delete confirmation
   adding: false,
+  addingSession: false,    // the manual session-entry form is open
   renaming: null,          // student_id whose name is being edited
+  editingEmail: null,      // student_id whose email is being edited
+  selectedRejected: new Set(),   // session keys ticked for bulk recovery
   busy: false,
 };
 
@@ -607,11 +648,12 @@ function flagCategories(s) {
   if (sources.includes('auto-close')) out.push('auto');
   if (sources.includes('offline')) out.push('offline');
   if (sources.includes('admin')) out.push('admin');
+  if (sources.includes('manual')) out.push('manual');
   return out;
 }
 
 function flagCounts() {
-  const counts = { all: 0, review: 0, auto: 0, offline: 0, admin: 0 };
+  const counts = { all: 0, review: 0, auto: 0, offline: 0, admin: 0, manual: 0 };
   for (const s of state.sessions) {
     if (!s.flagged && !s.needs_review) continue;
     counts.all++;
@@ -647,9 +689,12 @@ async function load() {
   // server's per-student stats blocks were built and shipped only to be
   // dropped on the floor. Asking for less also lets getRoster skip replaying
   // the event log entirely.
+  // includeRejected: the backend leaves rejected sessions out of the log
+  // entirely, which is what makes its totals right. This page needs them back
+  // to show the Rejected hours queue, and splits them off below.
   const [roster, timesheet] = await Promise.all([
     api.admin.getRoster(state.pin, { slim: true }, { timeoutMs: 30000 }),
-    api.admin.getTimesheet(state.pin, { slim: true }, { timeoutMs: 60000 }),
+    api.admin.getTimesheet(state.pin, { slim: true, includeRejected: true }, { timeoutMs: 60000 }),
   ]);
   const summaries = await api.admin.getSummaries(state.pin, null, { timeoutMs: 60000 })
     .catch((err) => {
@@ -660,7 +705,12 @@ async function load() {
     });
 
   state.students = roster.students.slice().sort((a, b) => a.name.localeCompare(b.name));
-  state.sessions = timesheet.sessions;
+  // THE split. Everything downstream reads state.sessions and can stay ignorant
+  // of rejection; the Rejected hours view is the only reader of state.rejected.
+  state.sessions = timesheet.sessions.filter((s) => s.event_status !== 'rejected');
+  state.rejected = timesheet.sessions.filter((s) => s.event_status === 'rejected');
+  state.gracePeriodHours = timesheet.grace_period_hours ?? 24;
+  state.selectedRejected = new Set();
   state.byStudent = new Map();
   for (const s of state.sessions) {
     if (!state.byStudent.has(s.student_id)) state.byStudent.set(s.student_id, []);
@@ -717,10 +767,13 @@ function render() {
   $('tab-roster').setAttribute('aria-selected', String(state.view === 'roster'));
   $('tab-timesheet').setAttribute('aria-selected', String(state.view === 'timesheet'));
   $('tab-flagged').setAttribute('aria-selected', String(state.view === 'flagged'));
+  $('tab-rejected').setAttribute('aria-selected', String(state.view === 'rejected'));
 
   const flagged = flagCounts();
   $('flag-count').textContent = flagged.all;
   $('flag-count').hidden = flagged.all === 0;
+  $('rejected-count').textContent = state.rejected.length;
+  $('rejected-count').hidden = state.rejected.length === 0;
 
   if (state.summariesError) {
     $('banner-msg').textContent = state.summariesError;
@@ -730,6 +783,7 @@ function render() {
   if (state.view === 'detail') $('view').innerHTML = detailHtml();
   else if (state.view === 'timesheet') $('view').innerHTML = timesheetHtml();
   else if (state.view === 'flagged') $('view').innerHTML = flaggedHtml();
+  else if (state.view === 'rejected') $('view').innerHTML = rejectedHtml();
   else $('view').innerHTML = rosterHtml();
 
   if (focusId && $(focusId)) {
@@ -772,19 +826,28 @@ function rosterHtml() {
     // While the name is being edited the row must not be a link to the detail
     // view — a click in the text field would navigate away mid-edit.
     const renaming = state.renaming === student.student_id;
+    const editingEmail = state.editingEmail === student.student_id;
+    // A row being edited must not also be a link to the detail view — a click
+    // in the text field would navigate away mid-edit.
+    const inline = renaming || editingEmail;
     return `
-      <tr ${renaming ? '' : `class="clickable" data-action="open" data-id="${esc(student.student_id)}"`}>
+      <tr ${inline ? '' : `class="clickable" data-action="open" data-id="${esc(student.student_id)}"`}>
         <td class="name-cell">${renaming ? renameInputHtml(student) : `${esc(student.name)}
           ${student.active ? '' : ' <span class="pill pill--quiet">Archived</span>'}
           ${livePill(st.open)}`}</td>
         <td class="muted">${esc(student.grade || '—')}</td>
+        <td class="email-cell">${editingEmail ? emailInputHtml(student) : emailCellHtml(student)}</td>
         <td class="num">${fmtHours(st.totalMinutes)}</td>
         <td class="num">${st.count}</td>
         <td class="muted">${fmtWhen(st.lastSeen)}</td>
         <td>${st.problems ? '<span class="pill pill--review">⚠ ' + st.problems + ' to review</span>' : ''}</td>
-        <td><div class="row-actions">${renaming ? renameButtonsHtml(student) : `
-          <button class="btn btn--ghost btn-sm" data-action="rename"
+        <td><div class="row-actions">${
+          renaming ? renameButtonsHtml(student)
+          : editingEmail ? emailButtonsHtml(student)
+          : `<button class="btn btn--ghost btn-sm" data-action="rename"
                   data-id="${esc(student.student_id)}">Rename</button>
+          <button class="btn btn--ghost btn-sm" data-action="edit-email"
+                  data-id="${esc(student.student_id)}">Email</button>
           <button class="btn btn--ghost btn-sm" data-action="toggle-active"
                   data-id="${esc(student.student_id)}" data-active="${student.active}"
             >${student.active ? 'Archive' : 'Restore'}</button>`}</div></td>
@@ -821,10 +884,10 @@ function rosterHtml() {
     <div class="table-scroll">
       <table>
         <thead><tr>
-          <th>Name</th><th>Grade</th><th class="num">Hours</th><th class="num">Sessions</th>
+          <th>Name</th><th>Grade</th><th>Email</th><th class="num">Hours</th><th class="num">Sessions</th>
           <th>Last seen</th><th>Review</th><th></th>
         </tr></thead>
-        <tbody>${body || '<tr><td colspan="7" class="empty">No students match.</td></tr>'}</tbody>
+        <tbody>${body || '<tr><td colspan="8" class="empty">No students match.</td></tr>'}</tbody>
       </table>
     </div>`;
 }
@@ -839,6 +902,36 @@ function renameInputHtml(student) {
     <input class="input" id="rename-input" maxlength="80" autocomplete="off"
            aria-label="Full name" value="${esc(student.name)}">
     <span class="muted" id="rename-msg"></span>`;
+}
+
+/**
+ * The email cell. A student with no address is not a problem to flag — the
+ * tablet lets them skip it on purpose — so a missing one reads as a quiet dash
+ * rather than a warning.
+ */
+function emailCellHtml(student) {
+  if (!student.email) return '<span class="muted">—</span>';
+  return `<span class="email-cell__value" title="${esc(student.email)}">${esc(student.email)}</span>`;
+}
+
+/**
+ * Inline editor, matching the rename control. The id is stable so render() can
+ * restore focus and caret across the re-renders the live-counter timer causes
+ * while a coach is typing.
+ */
+function emailInputHtml(student) {
+  return `
+    <input class="input" id="email-input" type="email" maxlength="120" autocomplete="off"
+           inputmode="email" spellcheck="false" aria-label="Email address"
+           placeholder="name@example.com" value="${esc(student.email || '')}">
+    <span class="muted" id="email-msg"></span>`;
+}
+
+function emailButtonsHtml(student) {
+  return `
+    <button class="btn btn--primary btn-sm" data-action="email-save"
+            data-id="${esc(student.student_id)}" type="button">Save</button>
+    <button class="btn btn--ghost btn-sm" data-action="email-cancel" type="button">Cancel</button>`;
 }
 
 function renameButtonsHtml(student) {
@@ -862,6 +955,11 @@ function addFormHtml() {
       <div class="control">
         <label class="control__label" for="add-grade">Grade</label>
         <input class="input" id="add-grade" style="width:6rem" placeholder="11" autocomplete="off">
+      </div>
+      <div class="control">
+        <label class="control__label" for="add-email">Email <span class="muted">(optional)</span></label>
+        <input class="input" id="add-email" type="email" placeholder="name@example.com"
+               autocomplete="off" spellcheck="false">
       </div>
       <button class="btn btn--primary btn-sm" data-action="add-save" type="button">Add</button>
       <button class="btn btn--ghost btn-sm" data-action="add-cancel" type="button">Cancel</button>
@@ -946,8 +1044,11 @@ function timesheetHtml() {
         <input class="input" id="search" type="search" placeholder="Name or ID" value="${esc(state.search)}" autocomplete="off">
       </div>
       <span class="topbar__spacer"></span>
+      <button class="btn btn--ghost btn-sm" data-action="show-add-session" type="button">Add session</button>
       <button class="btn btn--primary btn-sm" data-action="export" type="button">Export CSV</button>
     </div>
+
+    ${state.addingSession ? addSessionFormHtml() : ''}
 
     <p class="muted" style="margin:0 0 0.75rem">${esc(rangeLabel())} · ${rows.length} students</p>
 
@@ -975,6 +1076,59 @@ function timesheetHtml() {
     </div>`;
 }
 
+/**
+ * Manual session entry — for the evening the tablet was unplugged, or the
+ * student who left their card at home.
+ *
+ * This is not the same thing as the Edit control on a session row. Edit
+ * supersedes an event that exists; this writes a session where there was never
+ * a scan at all, so there is nothing to correct.
+ *
+ * The server does the real validation (end after start, no overlap with a
+ * session that student already has, under max_session_minutes) because only it
+ * knows the whole log and the Config ceiling. The checks here are just to catch
+ * an empty field before spending a round trip on it.
+ */
+function addSessionFormHtml() {
+  const options = state.students
+    .filter((student) => student.active || state.showInactive)
+    .map((student) => `<option value="${esc(student.student_id)}">${esc(student.name)}` +
+                      `${student.active ? '' : ' (archived)'}</option>`).join('');
+
+  return `
+    <div class="card add-form">
+      <div class="control">
+        <label class="control__label" for="ms-student">Student</label>
+        <select class="input" id="ms-student">${options}</select>
+      </div>
+      <div class="control">
+        <label class="control__label" for="ms-date">Date</label>
+        <input class="input" id="ms-date" type="date" value="${esc(dateKey(new Date()))}"
+               max="${esc(dateKey(new Date()))}">
+      </div>
+      <div class="control">
+        <label class="control__label" for="ms-start">Start</label>
+        <input class="input" id="ms-start" type="time" style="width:8rem">
+      </div>
+      <div class="control">
+        <label class="control__label" for="ms-end">End</label>
+        <input class="input" id="ms-end" type="time" style="width:8rem">
+      </div>
+      <div class="control" style="flex:1;min-width:12rem">
+        <label class="control__label" for="ms-reason">Reason (saved in the log)</label>
+        <input class="input" id="ms-reason" placeholder="e.g. tablet was down" autocomplete="off">
+      </div>
+      <button class="btn btn--primary btn-sm" data-action="add-session-save" type="button">Add session</button>
+      <button class="btn btn--ghost btn-sm" data-action="add-session-cancel" type="button">Cancel</button>
+      <span class="muted" id="ms-msg" style="flex-basis:100%"></span>
+      <p class="muted" style="flex-basis:100%;margin:0;font-size:0.8125rem">
+        Both events are written with source &ldquo;manual&rdquo; and marked unverified, and the
+        session is exempt from the summary grace period — a coach entering it by hand is
+        the verification a summary would have provided.
+      </p>
+    </div>`;
+}
+
 // ---- Needs review ---------------------------------------------------------
 
 function flaggedHtml() {
@@ -994,6 +1148,7 @@ function flaggedHtml() {
           ${chip('auto', 'Auto-closed')}
           ${chip('offline', 'Offline replay')}
           ${chip('admin', 'Hand-corrected')}
+          ${chip('manual', 'Added by a coach')}
         </div>
       </div>
       <div class="control">
@@ -1018,6 +1173,192 @@ function flaggedHtml() {
     </div>`;
 }
 
+
+// ---- Rejected hours -------------------------------------------------------
+
+/**
+ * Sessions the grace-period job took out of the count, grouped by student.
+ *
+ * Grouped rather than listed flat because rejection happens in batches: the
+ * nightly job takes out everyone who did not write up Saturday's build session
+ * at once, and a flat list of forty rows makes it impossible to see that one
+ * student accounts for eight of them.
+ *
+ * Like Needs review, this ignores the timesheet's date range on purpose. These
+ * are hours a student has lost, and a filter that hides last month's is how
+ * they stay lost.
+ */
+function rejectedGroups() {
+  const term = state.search.trim().toLowerCase();
+  const byStudent = new Map();
+  for (const session of state.rejected) {
+    if (term && !String(session.name || '').toLowerCase().includes(term) &&
+        !session.student_id.includes(term)) continue;
+    if (!byStudent.has(session.student_id)) byStudent.set(session.student_id, []);
+    byStudent.get(session.student_id).push(session);
+  }
+  const groups = [...byStudent.entries()].map(([studentId, sessions]) => ({
+    studentId,
+    name: sessions[0].name || studentId,
+    sessions: sessions.slice().sort((a, b) =>
+      String(b.in_time || b.out_time).localeCompare(String(a.in_time || a.out_time))),
+    minutes: sessions.reduce((sum, x) => sum + (x.minutes || 0), 0),
+  }));
+  return groups.sort((a, b) => b.minutes - a.minutes || a.name.localeCompare(b.name));
+}
+
+/**
+ * Why this session stopped counting. There is exactly one rule that rejects a
+ * session, so this states it with the configured number rather than inventing
+ * a per-row reason the backend does not record.
+ */
+function rejectReason(session) {
+  const hours = state.gracePeriodHours;
+  return `No summary submitted within ${hours}h of scanning out on ` +
+         fmtDate(session.out_time || session.in_time);
+}
+
+/** Both event ids of a session — what recoverEvents needs to restore it. */
+function sessionEventIds(session) {
+  return [session.in_event_id, session.out_event_id].filter(Boolean);
+}
+
+function rejectedHtml() {
+  const groups = rejectedGroups();
+  const shown = groups.reduce((sum, g) => sum + g.sessions.length, 0);
+  const totalMinutes = groups.reduce((sum, g) => sum + g.minutes, 0);
+  const selected = state.selectedRejected.size;
+
+  const body = groups.map((group) => {
+    const allTicked = group.sessions.every((x) => state.selectedRejected.has(sessionKey(x)));
+    return `
+    <div class="card reject-group">
+      <div class="reject-group__head">
+        <input type="checkbox" data-action="select-group" data-id="${esc(group.studentId)}"
+               aria-label="Select all rejected sessions for ${esc(group.name)}"
+               ${allTicked ? 'checked' : ''}>
+        <button class="who-link reject-group__name" data-action="open"
+                data-id="${esc(group.studentId)}">${esc(group.name)}</button>
+        <span class="muted">${group.sessions.length} session${group.sessions.length === 1 ? '' : 's'}
+          · ${fmtHours(group.minutes)} h not counting</span>
+        <span style="flex:1"></span>
+        <button class="btn btn--ghost btn-sm" data-action="recover-group"
+                data-id="${esc(group.studentId)}">Recover all</button>
+      </div>
+      ${group.sessions.map((session) => {
+        const key = sessionKey(session);
+        return `
+        <div class="reject-row">
+          <input type="checkbox" data-action="select-rejected" data-key="${esc(key)}"
+                 aria-label="Select this session"
+                 ${state.selectedRejected.has(key) ? 'checked' : ''}>
+          <div>
+            <div class="session__date">${fmtDate(session.in_time || session.out_time)}</div>
+            <span class="muted" style="font-size:0.8125rem">${
+              session.in_time ? fmtTime(session.in_time) : '—'} → ${
+              session.out_time ? fmtTime(session.out_time) : '—'}</span>
+          </div>
+          <div class="session__dur">${fmtDur(session.minutes)}</div>
+          <div class="reject-row__reason">${esc(rejectReason(session))}</div>
+          <button class="btn btn--ghost btn-sm" data-action="recover"
+                  data-key="${esc(key)}">Recover</button>
+        </div>`;
+      }).join('')}
+    </div>`;
+  }).join('');
+
+  return `
+    <div class="controls">
+      <div class="control">
+        <label class="control__label" for="search">Search</label>
+        <input class="input input--search" id="search" type="search" placeholder="Name or ID"
+               value="${esc(state.search)}" autocomplete="off">
+      </div>
+    </div>
+
+    ${selected ? `
+      <div class="bulkbar">
+        <strong>${selected} session${selected === 1 ? '' : 's'} selected</strong>
+        <span class="muted">${fmtHours(selectedRejectedMinutes())} h would go back into the totals</span>
+        <span style="flex:1"></span>
+        <button class="btn btn--ghost btn-sm" data-action="clear-selection">Clear</button>
+        <button class="btn btn--primary btn-sm" data-action="recover-selected">Recover selected</button>
+      </div>` : ''}
+
+    <p class="muted" style="margin:0 0 0.75rem">
+      ${shown} rejected session${shown === 1 ? '' : 's'} · ${fmtHours(totalMinutes)} h not counting ·
+      all dates · grace period ${state.gracePeriodHours}h
+    </p>
+
+    ${body || `<div class="card"><div class="empty">
+      Nothing has been rejected. Every completed session either has a summary or is
+      still inside its ${state.gracePeriodHours}-hour grace period. 🎉
+    </div></div>`}`;
+}
+
+function selectedRejectedMinutes() {
+  let total = 0;
+  for (const session of state.rejected) {
+    if (state.selectedRejected.has(sessionKey(session))) total += session.minutes || 0;
+  }
+  return total;
+}
+
+/**
+ * Put rejected sessions back into the count.
+ *
+ * Optimistic like every other write here: the rows move from state.rejected
+ * into state.sessions immediately so the totals jump the moment the button is
+ * pressed, and the server's rebuilt timeline replaces the guess when it lands.
+ * Restoring an event can re-pair the sessions around it, which is why the
+ * response carries whole timelines rather than a list of ids.
+ */
+function recoverSessions(sessions) {
+  if (!sessions.length) return;
+  const eventIds = [];
+  for (const session of sessions) eventIds.push(...sessionEventIds(session));
+  if (!eventIds.length) return;
+
+  const keys = new Set(sessions.map(sessionKey));
+  const affected = [...new Set(sessions.map((x) => x.student_id))];
+
+  optimistic(
+    () => {
+      const beforeRejected = state.rejected.slice();
+      const undoSessions = affected.map((studentId) => snapshotSessions(studentId));
+      state.rejected = state.rejected.filter((x) => !keys.has(sessionKey(x)));
+      for (const studentId of affected) {
+        const restored = sessions
+          .filter((x) => x.student_id === studentId)
+          .map((x) => ({ ...x, event_status: 'recovered' }));
+        setStudentSessions(studentId, (state.byStudent.get(studentId) || []).concat(restored));
+      }
+      for (const key of keys) state.selectedRejected.delete(key);
+      return () => {
+        state.rejected = beforeRejected;
+        for (const undo of undoSessions) undo();
+      };
+    },
+    () => api.admin.recoverEvents(state.pin, eventIds, { timeoutMs: 60000 }),
+    (data) => {
+      const byStudent = (data && data.sessions_by_student) || {};
+      for (const studentId of Object.keys(byStudent)) {
+        const all = byStudent[studentId];
+        // The rebuilt timeline holds only what counts, which is exactly what
+        // state.sessions is for. Anything of this student's still rejected
+        // stays where it is, in state.rejected.
+        setStudentSessions(studentId, all);
+      }
+    },
+    sessions.length === 1 ? 'Could not recover that session'
+                          : `Could not recover ${sessions.length} sessions`
+  );
+}
+
+function rejectedByKey(key) {
+  return state.rejected.find((x) => sessionKey(x) === key) || null;
+}
+
 // ---- Student detail -------------------------------------------------------
 
 function detailHtml() {
@@ -1030,6 +1371,7 @@ function detailHtml() {
   const timeline = timelineFor(student.student_id);
   const summaryCount = summariesOf(student.student_id).length;
   const renaming = state.renaming === student.student_id;
+  const editingEmail = state.editingEmail === student.student_id;
 
   return `
     <button class="back" data-action="back">← All students</button>
@@ -1043,11 +1385,20 @@ function detailHtml() {
           ID ${esc(student.student_id)}${student.grade ? ' · Grade ' + esc(student.grade) : ''}
           ${student.active ? '' : ' · <span class="pill pill--quiet">Archived</span>'}
         </p>
+        <p class="muted" style="margin:0.25rem 0 0">${editingEmail
+          ? emailInputHtml(student)
+          : (student.email
+              ? '✉ ' + esc(student.email)
+              : '<span class="muted">No email — they will not get a summary link when they scan out.</span>')}</p>
       </div>
       <span class="topbar__spacer"></span>
-      <div class="row-actions">${renaming ? renameButtonsHtml(student) : `
-        <button class="btn btn--ghost btn-sm" data-action="rename"
+      <div class="row-actions">${
+        renaming ? renameButtonsHtml(student)
+        : editingEmail ? emailButtonsHtml(student)
+        : `<button class="btn btn--ghost btn-sm" data-action="rename"
                 data-id="${esc(student.student_id)}">Rename</button>
+        <button class="btn btn--ghost btn-sm" data-action="edit-email"
+                data-id="${esc(student.student_id)}">${student.email ? 'Edit email' : 'Add email'}</button>
         <button class="btn btn--ghost btn-sm" data-action="toggle-active"
                 data-id="${esc(student.student_id)}" data-active="${student.active}"
           >${student.active ? 'Archive' : 'Restore'}</button>`}</div>
@@ -1175,6 +1526,8 @@ function sessionRowHtml(s, opts = {}) {
   const problem = PROBLEM[s.status];
   const autoClosed = (s.sources || []).includes('auto-close');
   const offline = (s.sources || []).includes('offline');
+  const manual = (s.sources || []).includes('manual');
+  const recovered = s.event_status === 'recovered';
 
   let duration;
   if (s.status === 'closed') duration = fmtDur(s.minutes);
@@ -1186,7 +1539,12 @@ function sessionRowHtml(s, opts = {}) {
     problem ? `<span class="pill pill--${problem.pill}" title="${esc(problem.why)}">⚠ ${problem.text}</span>` : '',
     autoClosed ? '<span class="pill pill--review">⏱ Auto-closed at lab close</span>' : '',
     offline ? '<span class="pill pill--review">📴 Offline replay</span>' : '',
-    !autoClosed && !offline && s.flagged ? '<span class="pill pill--review">⚑ Unverified time</span>' : '',
+    // Sits next to the auto-close pill on purpose: both mean "this time was not
+    // measured by a scan", and a coach reading the timeline needs to see which.
+    manual ? '<span class="pill pill--review">✍️ Added by a coach</span>' : '',
+    recovered ? '<span class="pill pill--in">↩ Recovered by a late summary</span>' : '',
+    !autoClosed && !offline && !manual && s.flagged
+      ? '<span class="pill pill--review">⚑ Unverified time</span>' : '',
   ].filter(Boolean).join(' ');
 
   return `
@@ -1534,10 +1892,12 @@ async function addStudent() {
   const id = ($('add-id')?.value || '').trim();
   const name = ($('add-name')?.value || '').trim();
   const grade = ($('add-grade')?.value || '').trim();
+  const email = ($('add-email')?.value || '').trim();
   const msg = $('add-msg');
 
   if (!/^\d{7}$/.test(id)) { msg.textContent = 'The ID must be exactly 7 digits.'; return; }
   if (name.length < 2) { msg.textContent = 'Enter a full name.'; return; }
+  if (email && !looksLikeEmail(email)) { msg.textContent = 'That email does not look right.'; return; }
 
   // The one write that is NOT optimistic. enroll is the duplicate-ID check —
   // showing a student on the roster and then yanking them back out because the
@@ -1545,10 +1905,10 @@ async function addStudent() {
   // already showing "Saving…". It still patches instead of re-fetching.
   msg.textContent = 'Saving…';
   await withBusy(async () => {
-    const created = await api.enroll(id, name, grade);
+    const created = await api.enroll(id, name, grade, email);
     state.students.push({
       student_id: created.student_id, name: created.name,
-      grade: created.grade, active: created.active,
+      grade: created.grade, active: created.active, email: created.email || '',
     });
     state.students.sort((a, b) => a.name.localeCompare(b.name));
     state.adding = false;
@@ -1589,6 +1949,96 @@ async function saveRename(studentId) {
     (data) => { if (data && data.student) Object.assign(student, data.student); },
     `Could not rename ${previous}`
   );
+}
+
+/**
+ * Same loose shape the tablet and the backend use. The only thing worth
+ * catching client-side is a typo like "sam@gmail" or a name in the wrong box.
+ */
+const looksLikeEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v);
+
+/**
+ * Add or correct an email after enrollment.
+ *
+ * The tablet lets a student skip the field in one tap, which is the right
+ * trade at a kiosk with a queue — so most addresses arrive here instead, from a
+ * coach with a roster in front of them. Clearing it (an empty box) is a valid
+ * save: it stops the scan-out emails for a student who asked not to get them.
+ *
+ * Like the rename, this only touches roster data. Events key off student_id
+ * alone, so no hour or session moves.
+ */
+async function saveEmail(studentId) {
+  const student = state.students.find((x) => x.student_id === studentId);
+  const email = ($('email-input')?.value || '').trim();
+  const msg = $('email-msg');
+
+  if (email && !looksLikeEmail(email)) {
+    if (msg) msg.textContent = 'That does not look like an email address.';
+    return;
+  }
+  if (!student || email === (student.email || '')) { state.editingEmail = null; render(); return; }
+
+  state.editingEmail = null;
+  const previous = student.email || '';
+
+  optimistic(
+    () => {
+      student.email = email;
+      return () => { student.email = previous; };
+    },
+    () => api.admin.setEmail(state.pin, studentId, email),
+    (data) => { if (data && data.student) Object.assign(student, data.student); },
+    `Could not save the email for ${student.name}`
+  );
+}
+
+/**
+ * Write a whole session by hand.
+ *
+ * NOT optimistic, unlike everything else on this page. The server owns the
+ * three checks that make this safe — end after start, no overlap with a
+ * session the student already has, under max_session_minutes — and only it can
+ * see the whole log. Painting a session onto the timesheet and then yanking it
+ * back out because it collided with a scan the coach forgot about is worse
+ * than the second it takes to ask.
+ */
+async function addManualSession() {
+  const studentId = $('ms-student')?.value || '';
+  const date = ($('ms-date')?.value || '').trim();
+  const start = ($('ms-start')?.value || '').trim();
+  const end = ($('ms-end')?.value || '').trim();
+  const reason = ($('ms-reason')?.value || '').trim();
+  const msg = $('ms-msg');
+
+  if (!studentId) { msg.textContent = 'Pick a student.'; return; }
+  if (!date) { msg.textContent = 'Pick a date.'; return; }
+  if (!start || !end) { msg.textContent = 'Enter both a start and an end time.'; return; }
+  if (end <= start) { msg.textContent = 'The end time must be after the start time.'; return; }
+
+  if (state.busy) return;
+  state.busy = true;
+  msg.textContent = 'Saving…';
+  try {
+    const created = await api.admin.addManualSession(state.pin, studentId,
+      { date, start, end, reason }, { timeoutMs: 30000 });
+    // The server hands back the student's whole rebuilt timeline, so there is
+    // nothing to re-fetch and nothing to guess about how the new pair sits
+    // among the scans already on file.
+    if (created.sessions) setStudentSessions(studentId, created.sessions);
+    state.addingSession = false;
+    state.busy = false;
+    render();
+    toast(`Added ${fmtDur(created.minutes)} for ${created.name} on ${created.date}.`);
+    return;
+  } catch (err) {
+    // Inline, not in the banner: the overlap and ceiling messages name the
+    // exact session that collided, and a coach needs to read that next to the
+    // times they typed so they can change them.
+    state.busy = false;
+    render();
+    if ($('ms-msg')) $('ms-msg').textContent = err instanceof ApiError ? err.message : String(err);
+  }
 }
 
 async function toggleActive(studentId, currentlyActive) {
@@ -1646,14 +2096,14 @@ function csvCell(value) {
 
 function exportCsv() {
   const rows = timesheetRows();
-  const header = ['student_id', 'name', 'grade', 'active', 'total_hours', 'total_minutes',
+  const header = ['student_id', 'name', 'grade', 'email', 'active', 'total_hours', 'total_minutes',
                   'sessions', 'avg_session_minutes', 'longest_minutes', 'shortest_minutes',
                   'sessions_per_week', 'last_seen', 'sessions_needing_review'];
 
   const lines = [header.join(',')];
   for (const { student, st } of rows) {
     lines.push([
-      student.student_id, student.name, student.grade, student.active,
+      student.student_id, student.name, student.grade, student.email || '', student.active,
       fmtHours(st.totalMinutes), st.totalMinutes, st.count,
       st.average ?? '', st.longest ?? '', st.shortest ?? '', st.perWeek ?? '',
       st.lastSeen ? new Date(st.lastSeen).toLocaleString() : '', st.problems,
@@ -1684,18 +2134,25 @@ $('view').addEventListener('click', (event) => {
 
   switch (action) {
     case 'open':        state.view = 'detail'; state.detailId = id; state.editing = null;
-                        state.confirming = null; state.renaming = null;
+                        state.confirming = null; state.renaming = null; state.editingEmail = null;
                         render(); window.scrollTo(0, 0); break;
     case 'back':        state.view = 'roster'; state.detailId = null; state.renaming = null;
-                        render(); break;
+                        state.editingEmail = null; render(); break;
     case 'toggle-active': toggleActive(id, active === 'true'); break;
     case 'rename':      state.renaming = id; state.editing = null; state.confirming = null;
                         render(); $('rename-input')?.select(); break;
     case 'rename-save': saveRename(id); break;
     case 'rename-cancel': state.renaming = null; render(); break;
+    case 'edit-email':  state.editingEmail = id; state.renaming = null; state.editing = null;
+                        state.confirming = null; render(); $('email-input')?.select(); break;
+    case 'email-save':  saveEmail(id); break;
+    case 'email-cancel': state.editingEmail = null; render(); break;
     case 'show-add':    state.adding = true; render(); $('add-id')?.focus(); break;
     case 'add-cancel':  state.adding = false; render(); break;
     case 'add-save':    addStudent(); break;
+    case 'show-add-session': state.addingSession = true; render(); $('ms-student')?.focus(); break;
+    case 'add-session-cancel': state.addingSession = false; render(); break;
+    case 'add-session-save': addManualSession(); break;
     case 'sort':        state.sort = state.sort.key === el.dataset.key
                           ? { key: el.dataset.key, dir: -state.sort.dir }
                           : { key: el.dataset.key, dir: el.dataset.key === 'name' ? 1 : -1 };
@@ -1712,13 +2169,45 @@ $('view').addEventListener('click', (event) => {
     case 'confirm-delete-summary': deleteSummary(key); break;
     case 'cancel-delete': state.confirming = null; render(); break;
     case 'confirm-delete': deleteSession(key); break;
+    case 'recover': {
+      const session = rejectedByKey(key);
+      if (session) recoverSessions([session]);
+      break;
+    }
+    case 'recover-group': {
+      recoverSessions(state.rejected.filter((x) => x.student_id === id));
+      break;
+    }
+    case 'recover-selected':
+      recoverSessions(state.rejected.filter((x) => state.selectedRejected.has(sessionKey(x))));
+      break;
+    case 'clear-selection': state.selectedRejected.clear(); render(); break;
+    // Checkboxes are handled here rather than in the input listener below so a
+    // click on the label or the box takes the same path.
+    case 'select-rejected':
+      if (state.selectedRejected.has(key)) state.selectedRejected.delete(key);
+      else state.selectedRejected.add(key);
+      render(); break;
+    case 'select-group': {
+      const group = state.rejected.filter((x) => x.student_id === id);
+      const allTicked = group.every((x) => state.selectedRejected.has(sessionKey(x)));
+      for (const session of group) {
+        if (allTicked) state.selectedRejected.delete(sessionKey(session));
+        else state.selectedRejected.add(sessionKey(session));
+      }
+      render(); break;
+    }
   }
 });
 
 $('view').addEventListener('keydown', (event) => {
-  if (event.target.id !== 'rename-input') return;
-  if (event.key === 'Enter') { event.preventDefault(); saveRename(state.renaming); }
-  else if (event.key === 'Escape') { state.renaming = null; render(); }
+  if (event.target.id === 'rename-input') {
+    if (event.key === 'Enter') { event.preventDefault(); saveRename(state.renaming); }
+    else if (event.key === 'Escape') { state.renaming = null; render(); }
+  } else if (event.target.id === 'email-input') {
+    if (event.key === 'Enter') { event.preventDefault(); saveEmail(state.editingEmail); }
+    else if (event.key === 'Escape') { state.editingEmail = null; render(); }
+  }
 });
 
 $('view').addEventListener('input', (event) => {
@@ -1729,15 +2218,21 @@ $('view').addEventListener('input', (event) => {
   else if (el.id === 'show-inactive') { state.showInactive = el.checked; render(); }
 });
 
-$('tab-roster').addEventListener('click', () => {
-  state.view = 'roster'; state.detailId = null; state.renaming = null; render();
-});
-$('tab-timesheet').addEventListener('click', () => {
-  state.view = 'timesheet'; state.detailId = null; state.renaming = null; render();
-});
-$('tab-flagged').addEventListener('click', () => {
-  state.view = 'flagged'; state.detailId = null; state.renaming = null; render();
-});
+/** Leaving a view abandons whatever inline editor was open in it. */
+function goto(view) {
+  state.view = view;
+  state.detailId = null;
+  state.renaming = null;
+  state.editingEmail = null;
+  state.editing = null;
+  state.confirming = null;
+  render();
+}
+
+$('tab-roster').addEventListener('click', () => goto('roster'));
+$('tab-timesheet').addEventListener('click', () => goto('timesheet'));
+$('tab-flagged').addEventListener('click', () => goto('flagged'));
+$('tab-rejected').addEventListener('click', () => goto('rejected'));
 $('refresh').addEventListener('click', refresh);
 $('banner-retry').addEventListener('click', refresh);
 $('lock').addEventListener('click', () => {

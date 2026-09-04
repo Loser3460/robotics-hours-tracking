@@ -162,8 +162,13 @@ export function scan(studentId, options = {}) {
   return request('scan', { student_id: studentId, source: options.source || 'tablet' }, options);
 }
 
-export function enroll(studentId, name, grade = '', options = {}) {
-  return request('enroll', { student_id: studentId, name, grade }, options);
+/**
+ * Add a student to the roster. `email` is optional in the real sense: the
+ * tablet's enrollment sheet has a Skip button, and an empty string is a normal
+ * answer the backend accepts without complaint.
+ */
+export function enroll(studentId, name, grade = '', email = '', options = {}) {
+  return request('enroll', { student_id: studentId, name, grade, email }, options);
 }
 
 /**
@@ -187,9 +192,37 @@ export function lookupStudent(studentId, date = null, options = {}) {
   return request('lookupStudent', payload, options);
 }
 
-/** photos: array of data: URLs or {name, mimeType, data} objects. */
-export function submitSummary(studentId, text, photos = [], sessionDate = null, options = {}) {
-  const payload = { student_id: studentId, text, photos };
+/**
+ * Resolve a summary link token (?t=… in the emailed link) to the student who
+ * owns it, and optionally that day's lab time.
+ *
+ * Resolves to {found:false} for a token that means nothing, rather than
+ * throwing — an expired bookmark should send the student back to the ID entry
+ * screen, not show them a server error.
+ *
+ * Note what is NOT in the response: the student_id. The link deliberately
+ * carries a token instead of an ID because an ID is what `scan` and `enroll`
+ * accept, and a forwarded link must not hand one out. submitSummary takes the
+ * token in its place.
+ */
+export function lookupToken(token, date = null, options = {}) {
+  const payload = { t: token };
+  if (date) payload.date = date;
+  return request('lookupToken', payload, options);
+}
+
+/**
+ * photos: array of data: URLs or {name, mimeType, data} objects.
+ *
+ * `who` is either {studentId} — the scanned or typed-in path — or {token},
+ * for a student who arrived through their emailed link and never saw their ID.
+ */
+export function submitSummary(who, text, photos = [], sessionDate = null, options = {}) {
+  const payload = { text, photos };
+  if (typeof who === 'string') payload.student_id = who;
+  else if (who && who.token) payload.token = who.token;
+  else if (who && who.studentId) payload.student_id = who.studentId;
+  else throw new ApiError('submitSummary needs a student id or a summary token', 'config');
   if (sessionDate) payload.session_date = sessionDate;
   return request('submitSummary', payload, options);
 }
@@ -212,8 +245,16 @@ export const admin = {
    * per-student totals block; the admin page formats its own times and groups
    * its own totals from rows it already holds.
    */
-  getTimesheet: (pin, { from = null, to = null, studentId = null, slim = false } = {}, options = {}) =>
-    request('getTimesheet', { pin, from, to, student_id: studentId, slim }, options),
+  /**
+   * `includeRejected` asks for sessions the grace-period job took out of the
+   * count. They come back carrying event_status ('active' | 'rejected' |
+   * 'recovered'); everything the server totals still skips the rejected ones,
+   * and so must anything the caller totals.
+   */
+  getTimesheet: (pin, { from = null, to = null, studentId = null, slim = false,
+                        includeRejected = false } = {}, options = {}) =>
+    request('getTimesheet', { pin, from, to, student_id: studentId, slim,
+                              include_rejected: includeRejected }, options),
   getStudent: (pin, studentId, options = {}) => request('getStudent', { pin, student_id: studentId }, options),
   /** Every summary in one call, or one student's with studentId. */
   getSummaries: (pin, studentId = null, options = {}) =>
@@ -242,6 +283,28 @@ export const admin = {
    */
   setName: (pin, studentId, name, options = {}) =>
     request('setName', { pin, student_id: studentId, name }, options),
+  /**
+   * Add or correct an email. Pass '' to clear it, which stops the scan-out
+   * emails. Resolves to {student_id, email, previous_email, changed, student}.
+   */
+  setEmail: (pin, studentId, email, options = {}) =>
+    request('setEmail', { pin, student_id: studentId, email }, options),
+  /**
+   * Write a session by hand — for the night the tablet was down, where there
+   * is no scan to correct. `date` is YYYY-MM-DD, `start`/`end` are "HH:mm"
+   * local. The server rejects an end before the start, an overlap with a
+   * session the student already has, and anything over max_session_minutes.
+   * Resolves with `sessions`: that student's rebuilt timeline.
+   */
+  addManualSession: (pin, studentId, { date, start, end, reason = '' } = {}, options = {}) =>
+    request('addManualSession', { pin, student_id: studentId, date, start, end, reason }, options),
+  /**
+   * Put rejected sessions back into the count. Takes the event ids of both
+   * ends of each session, so a bulk recovery is one request. Resolves to
+   * {recovered, skipped, sessions_by_student}.
+   */
+  recoverEvents: (pin, eventIds, options = {}) =>
+    request('recoverEvents', { pin, event_ids: eventIds }, options),
 };
 
 // --- health -----------------------------------------------------------------

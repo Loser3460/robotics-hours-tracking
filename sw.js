@@ -37,7 +37,13 @@
 // v5: admin.getRoster grew an options argument before the request options. A
 // stale api.js would swallow index.html's timeoutMs as the new argument, so
 // the pair has to land together.
-const VERSION = 'v5';
+// v6: emails, summary tokens, rejected hours and manual entry. api.js changed
+// shape in two ways that break silently against a stale page: enroll() gained
+// an `email` argument in fourth position, where admin.html used to pass
+// nothing and index.html now passes one, and submitSummary() takes an
+// identifier object instead of a bare student id. A cached v5 api.js paired
+// with a new summary.html would post `[object Object]` as a student id.
+const VERSION = 'v6';
 const CACHE = 'lab-shell-' + VERSION;
 
 /** Everything needed to boot the scanner with no network at all. */

@@ -9,8 +9,13 @@
  *   1. Run initializeSheets() once from the editor. Grant the permissions it asks
  *      for. It creates the tabs, the Drive folder, and the Config defaults, and
  *      logs the generated admin PIN.
- *   2. Run installAutoCloseTrigger() once to schedule the nightly session closer.
- *   3. Deploy as a Web App and paste the /exec URL into the frontend's config.js.
+ *   2. Set Config.summary_base_url to the public URL of summary.html, so the
+ *      scan-out emails have a link to send.
+ *   3. Run installNightlyTrigger() once — it schedules nightlyMaintenance(),
+ *      which auto-closes forgotten sessions and THEN rejects unlogged ones.
+ *   4. Run installSummaryEmailTrigger() once, for the every-5-minutes flusher
+ *      that actually sends the queued summary emails.
+ *   5. Deploy as a Web App and paste the /exec URL into the frontend's config.js.
  *
  * ============================ READ THIS BEFORE EDITING =====================
  *
@@ -34,7 +39,9 @@
  *   flagged = true so the admin UI can show them as unverified.
  *
  * Append-only log
- *   Events is immutable. Nothing here ever rewrites or deletes an Events row,
+ *   Events is immutable, with ONE exception: the `status` column, which is a
+ *   review flag rather than a fact about attendance (active / rejected /
+ *   recovered). Nothing here ever rewrites or deletes an Events row,
  *   and no total_hours / currently_in / last_seen is ever stored. Every
  *   statistic is recomputed from the log on read. Corrections append a new row
  *   whose note supersedes or voids an earlier event_id — see resolveEvents_().
@@ -56,8 +63,8 @@ var TAB_CONFIG    = 'Config';
  * or insert a column in the middle — append at the end if you must extend.
  */
 var HEADERS = {};
-HEADERS[TAB_STUDENTS]  = ['student_id', 'name', 'grade', 'active', 'created_at'];
-HEADERS[TAB_EVENTS]    = ['event_id', 'student_id', 'timestamp', 'direction', 'source', 'flagged', 'note'];
+HEADERS[TAB_STUDENTS]  = ['student_id', 'name', 'grade', 'active', 'created_at', 'email', 'summary_token'];
+HEADERS[TAB_EVENTS]    = ['event_id', 'student_id', 'timestamp', 'direction', 'source', 'flagged', 'note', 'status'];
 HEADERS[TAB_SUMMARIES] = ['summary_id', 'student_id', 'session_date', 'text', 'photo_urls', 'submitted_at'];
 HEADERS[TAB_CONFIG]    = ['key', 'value'];
 
@@ -71,6 +78,39 @@ var SOURCE_TABLET    = 'tablet';
 var SOURCE_OFFLINE   = 'offline';
 var SOURCE_ADMIN     = 'admin';
 var SOURCE_AUTOCLOSE = 'auto-close';
+var SOURCE_MANUAL    = 'manual';    // a coach typed the whole session in by hand
+
+/**
+ * Events.status — the lifecycle of an event, NOT a fact about attendance.
+ *
+ *   active     the default; counts toward hours
+ *   rejected   the session it belongs to went past the grace period with no
+ *              summary, so it stops counting
+ *   recovered  a late summary arrived and put it back
+ *
+ * This is the only mutable cell in Events, and it is deliberately not part of
+ * the append-only rule: student_id, timestamp, direction and source are the
+ * immutable record of what happened, while status records what a policy later
+ * decided about it. Writing rejection as a superseding event instead would
+ * destroy the pairing (there is no "half an event" to supersede) and would make
+ * a nightly job that rejects 40 sessions append 80 rows every night.
+ */
+var STATUS_ACTIVE    = 'active';
+var STATUS_REJECTED  = 'rejected';
+var STATUS_RECOVERED = 'recovered';
+
+// Column index (1-based) of Events.status. Column order is the contract.
+var COL_EVENT_STATUS = 8;
+// Column indexes of the two Students columns written in place after enrollment.
+var COL_STUDENT_EMAIL = 6;
+var COL_STUDENT_TOKEN = 7;
+
+// Outbound summary emails wait here between the scan that created them and the
+// flushSummaryEmails trigger that sends them. See "Summary emails" below.
+var MAIL_QUEUE_KEY   = 'summary_mail_queue';
+var MAIL_QUEUE_MAX   = 400;
+var MAIL_MAX_AGE_MS  = 24 * 3600 * 1000;
+var MAIL_QUOTA_WARN  = 15;
 
 var LOCK_TIMEOUT_MS  = 25000;
 var MAX_PHOTOS       = 4;
@@ -180,6 +220,7 @@ function doPost(e) {
       case 'syncQueue':     return json_(actionSyncQueue_(payload));
       case 'submitSummary': return json_(actionSubmitSummary_(payload));
       case 'lookupStudent': return json_(actionLookupStudent_(payload));
+      case 'lookupToken':   return json_(actionLookupToken_(payload));
 
       // Admin actions — every one of these requires the PIN in the body.
       case 'getRoster':     return json_(actionGetRoster_(payload));
@@ -191,6 +232,9 @@ function doPost(e) {
       case 'deleteEvent':   return json_(actionDeleteEvent_(payload));
       case 'setActive':     return json_(actionSetActive_(payload));
       case 'setName':       return json_(actionSetName_(payload));
+      case 'setEmail':      return json_(actionSetEmail_(payload));
+      case 'addManualSession': return json_(actionAddManualSession_(payload));
+      case 'recoverEvents': return json_(actionRecoverEvents_(payload));
 
       default: fail_('unknown action: ' + action);
     }
@@ -354,7 +398,10 @@ var CACHE_CHUNK_CHARS = 32000;  // a cached value caps at 100KB; UTF-8 is <=3B/c
 var CACHE_MAX_CHUNKS = 40;      // ~1.2MB of JSON; past that, just read the sheet
 
 function cacheKey_(name) {
-  return 'tbl.v1.' + name;
+  // v2: Students grew email/summary_token and Events grew status. A v1 entry
+  // holds rows without those fields, and serving one would look like every
+  // student had no email and every event were unrejected.
+  return 'tbl.v2.' + name;
 }
 
 function genKey_(name) {
@@ -648,8 +695,26 @@ function toEvent_(row) {
     direction: String(row.direction || '').trim().toLowerCase(),
     source: String(row.source || '').trim(),
     flagged: truthy_(row.flagged),
-    note: String(row.note || '').trim()
+    note: String(row.note || '').trim(),
+    status: normStatus_(row.status)
   };
+}
+
+/**
+ * Events written before the status column existed have a blank cell, and a
+ * blank means active. Anything unrecognised is also read as active: a typo in
+ * the sheet must not silently delete somebody's hours.
+ */
+function normStatus_(v) {
+  var s = String(v === null || v === undefined ? '' : v).trim().toLowerCase();
+  if (s === STATUS_REJECTED) return STATUS_REJECTED;
+  if (s === STATUS_RECOVERED) return STATUS_RECOVERED;
+  return STATUS_ACTIVE;
+}
+
+/** The one place that decides whether an event's hours count. */
+function counts_(status) {
+  return normStatus_(status) !== STATUS_REJECTED;
 }
 
 /**
@@ -665,7 +730,7 @@ function toEvent_(row) {
  * visible there forever, they just stop counting here. Chains work: if B
  * supersedes A and C supersedes B, only C survives.
  */
-function resolveEvents_(rows) {
+function resolveEvents_(rows, includeRejected) {
   var kept = [];
   var dropped = {};
   for (var i = 0; i < rows.length; i++) {
@@ -682,6 +747,12 @@ function resolveEvents_(rows) {
   for (var j = 0; j < kept.length; j++) {
     if (dropped[kept[j].event_id]) continue;
     if (kept[j].direction !== DIR_IN && kept[j].direction !== DIR_OUT) continue;
+    // THE rejection filter. Every statistic in this file is computed from the
+    // list resolveEvents_ returns, so dropping rejected events here is the one
+    // and only place hours stop counting — no per-calculation filtering, and
+    // no way for a new total to forget the rule. Rejection always covers both
+    // ends of a session, so the pairing in buildSessions_ stays consistent.
+    if (!includeRejected && !counts_(kept[j].status)) continue;
     out.push(kept[j]);
   }
   return sortByTs_(out);
@@ -762,7 +833,8 @@ function makeOrphan_(outEv) {
     minutes: null,
     flagged: !!outEv.flagged,
     needs_review: true,
-    sources: [outEv.source]
+    sources: [outEv.source],
+    event_status: normStatus_(outEv.status)
   };
 }
 
@@ -785,8 +857,19 @@ function makeSession_(inEv, outEv, status) {
     minutes: minutes,
     flagged: !!(inEv.flagged || (outEv && outEv.flagged)),
     needs_review: status !== 'closed' && status !== 'open',
-    sources: outEv ? [inEv.source, outEv.source] : [inEv.source]
+    sources: outEv ? [inEv.source, outEv.source] : [inEv.source],
+    // 'rejected' if either end is rejected, 'recovered' if either was restored.
+    // Rejection and recovery always move both ends together, so a mixed pair
+    // means somebody edited the sheet by hand; the stricter label wins.
+    event_status: mergeStatus_(inEv.status, outEv ? outEv.status : null)
   };
+}
+
+function mergeStatus_(a, b) {
+  var x = normStatus_(a), y = b == null ? x : normStatus_(b);
+  if (x === STATUS_REJECTED || y === STATUS_REJECTED) return STATUS_REJECTED;
+  if (x === STATUS_RECOVERED || y === STATUS_RECOVERED) return STATUS_RECOVERED;
+  return STATUS_ACTIVE;
 }
 
 /** Totals are ALWAYS computed here from the log — never stored anywhere. */
@@ -813,7 +896,38 @@ function summarize_(sessions) {
 
 function eventRow_(ev) {
   return [ev.event_id, ev.student_id, ev.timestamp, ev.direction,
-          ev.source, ev.flagged === true, ev.note || ''];
+          ev.source, ev.flagged === true, ev.note || '', ev.status || STATUS_ACTIVE];
+}
+
+/**
+ * Set Events.status on a set of rows, in one write.
+ *
+ * `updates` is [{_row, status}] using the 1-based sheet rows readTable_ hands
+ * back. The whole status column is read, patched in memory and written once —
+ * a getRange().setValue() per row would cost a round trip each and the nightly
+ * job touches dozens at a time.
+ *
+ * Caller must hold the lock.
+ */
+function setEventStatuses_(updates) {
+  if (!updates.length) return 0;
+  var sh = sheet_(TAB_EVENTS);
+  var lastRow = sh.getLastRow();
+  if (lastRow < 2) return 0;
+  var range = sh.getRange(2, COL_EVENT_STATUS, lastRow - 1, 1);
+  var col = range.getValues();
+  var changed = 0;
+  for (var i = 0; i < updates.length; i++) {
+    var idx = updates[i]._row - 2;                 // sheet row -> 0-based offset
+    if (idx < 0 || idx >= col.length) continue;
+    if (String(col[idx][0]).trim().toLowerCase() === updates[i].status) continue;
+    col[idx][0] = updates[i].status;
+    changed++;
+  }
+  if (!changed) return 0;
+  range.setValues(col);
+  invalidateTable_(TAB_EVENTS);                    // in place, so not via appendRows_
+  return changed;
 }
 
 // ---------------------------------------------------------------------------
@@ -832,15 +946,44 @@ function studentIndex_(rows) {
       active: truthy_(rows[i].active),
       created_at: rows[i].created_at instanceof Date ? toIso_(rows[i].created_at)
                                                      : String(rows[i].created_at || ''),
+      email: String(rows[i].email || '').trim(),
+      summary_token: String(rows[i].summary_token || '').trim(),
       _row: rows[i]._row
     };
   }
   return by;
 }
 
+/**
+ * The student record as the frontend sees it. summary_token is deliberately NOT
+ * here: it is that student's private link, and the admin page has no use for it
+ * that is worth putting every token on the wire on every roster load.
+ */
 function publicStudent_(s) {
   return { student_id: s.student_id, name: s.name, grade: s.grade,
-           active: s.active, created_at: s.created_at };
+           active: s.active, created_at: s.created_at, email: s.email || '' };
+}
+
+/**
+ * Validate an optional email. Returns '' for "not given", which is a first
+ * class answer — a student must be able to enroll in one tap without one.
+ *
+ * The check is deliberately loose. The only thing worth catching at the tablet
+ * is a typo shaped like "sam@gmail" or a name typed into the wrong box; a
+ * stricter pattern would reject valid addresses and strand a student at a
+ * kiosk with no keyboard help and a line behind them.
+ */
+function normEmail_(v) {
+  var e = String(v === null || v === undefined ? '' : v).trim();
+  if (!e) return '';
+  if (e.length > 120) fail_('that email address is too long');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e)) fail_('"' + e + '" does not look like an email address');
+  return e;
+}
+
+/** A fresh URL-safe summary token: 32 hex characters from a v4 UUID. */
+function newToken_() {
+  return Utilities.getUuid().replace(/-/g, '');
 }
 
 // ---------------------------------------------------------------------------
@@ -865,7 +1008,12 @@ function actionScan_(p) {
   var studentId = requireId_(p.student_id);
   var source = String(p.source || SOURCE_TABLET).trim() || SOURCE_TABLET;
 
-  return withLock_(function () {
+  // Filled in by the locked section when the scan closed a session and the
+  // student has an email. Queued AFTER the lock is released and never awaited:
+  // a student is standing at the tablet, and mail delivery is not their problem.
+  var mail = null;
+
+  var response = withLock_(function () {
     var students = studentIndex_(readTable_(TAB_STUDENTS));
     var student = students[studentId];
     if (!student) return ok_({ status: 'unknown', student_id: studentId });
@@ -907,6 +1055,18 @@ function actionScan_(p) {
     var durationMinutes = null;
     if (direction === DIR_OUT && last) durationMinutes = Math.max(0, minutesBetween_(last.ts, now));
 
+    if (direction === DIR_OUT && student.email && student.summary_token) {
+      mail = {
+        to: student.email,
+        name: student.name,
+        token: student.summary_token,
+        date: dateKey_(now),
+        minutes: durationMinutes,
+        in_time: last ? last.timestamp : null,
+        out_time: ev.timestamp
+      };
+    }
+
     return ok_({
       status: 'ok',
       student_id: studentId,
@@ -919,6 +1079,9 @@ function actionScan_(p) {
       session_start: direction === DIR_OUT && last ? last.timestamp : null
     });
   });
+
+  if (mail) queueSummaryEmail_(mail);
+  return response;
 }
 
 // ---------------------------------------------------------------------------
@@ -930,6 +1093,9 @@ function actionEnroll_(p) {
   var studentId = requireId_(p.student_id);
   var name = requireStr_(p, 'name', 80);
   var grade = p.grade === undefined || p.grade === null ? '' : String(p.grade).trim();
+  // Optional by design: the tablet's email field has a Skip button, and a
+  // student who skips it enrolls in one tap. An empty email is not an error.
+  var email = normEmail_(p.email);
 
   return withLock_(function () {
     var students = studentIndex_(readTable_(TAB_STUDENTS));
@@ -937,9 +1103,14 @@ function actionEnroll_(p) {
       fail_('student_id ' + studentId + ' is already enrolled as ' + students[studentId].name);
     }
     var created = nowIso_();
-    appendRows_(TAB_STUDENTS, [[studentId, name, grade, true, created]]);
+    // Every student gets a summary token at enrollment, email or not. A student
+    // who adds an email in March should not need a second migration pass to get
+    // a working link, and a coach can hand out the link by any other route.
+    var token = newToken_();
+    appendRows_(TAB_STUDENTS, [[studentId, name, grade, true, created, email, token]]);
     return ok_({
-      student_id: studentId, name: name, grade: grade, active: true, created_at: created
+      student_id: studentId, name: name, grade: grade, active: true,
+      created_at: created, email: email
     });
   });
 }
@@ -1115,34 +1286,85 @@ function actionLookupStudent_(p) {
   };
 
   if (date) {
-    var events = groupByStudent_(resolveEvents_(readTable_(TAB_EVENTS)))[studentId] || [];
-    var sessions = [];
-    var all = buildSessions_(events);
-    for (var i = 0; i < all.length; i++) {
-      if (all[i].date !== date) continue;
-      sessions.push({
-        status: all[i].status,
-        in_time: all[i].in_time,
-        out_time: all[i].out_time,
-        in_clock: all[i].in_clock,
-        out_clock: all[i].out_clock,
-        minutes: all[i].minutes,
-        flagged: all[i].flagged
-      });
-    }
+    var day = studentDay_(studentId, date);
     out.date = date;
-    out.sessions = sessions;
-
-    var summaries = resolveSummaries_(readTable_(TAB_SUMMARIES));
-    var already = 0;
-    for (var s = 0; s < summaries.length; s++) {
-      if (normId_(summaries[s].student_id) !== studentId) continue;
-      if (summaryDate_(summaries[s]) === date) already++;
-    }
-    out.summaries_on_date = already;
+    out.sessions = day.sessions;
+    out.summaries_on_date = day.summaries_on_date;
   }
 
   return ok_(out);
+}
+
+/**
+ * Resolve a summary link token to the student who owns it.
+ *
+ * This is what makes ?t=<token> work: the student clicks the link in their
+ * scan-out email and lands on a page that already knows who they are, with no
+ * ID to type and no camera to open.
+ *
+ * It deliberately does NOT return student_id. The whole reason the link carries
+ * a token instead of an ID is that a 7-digit ID is a credential — it is what
+ * `scan` and `enroll` accept — and a link that is forwarded, screenshotted or
+ * left in a browser history should not hand one out. submitSummary accepts the
+ * token in its place, so the page never needs the number.
+ *
+ * Unauthenticated, like lookupStudent, but strictly narrower: it takes a
+ * 32-character random token nobody can guess, and it writes nothing.
+ */
+function actionLookupToken_(p) {
+  var token = String(p.t || p.token || '').trim();
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(token)) return ok_({ found: false });
+
+  var student = studentByToken_(readTable_(TAB_STUDENTS), token);
+  if (!student) return ok_({ found: false });
+
+  var date = String(p.date || '').trim();
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) fail_('date must be YYYY-MM-DD');
+
+  var out = { found: true, name: student.name, grade: student.grade, active: student.active };
+  if (date) {
+    var day = studentDay_(student.student_id, date);
+    out.date = date;
+    out.sessions = day.sessions;
+    out.summaries_on_date = day.summaries_on_date;
+  }
+  return ok_(out);
+}
+
+/** Constant-ish token lookup. Tokens are unique; the first match wins. */
+function studentByToken_(rows, token) {
+  var students = studentIndex_(rows);
+  for (var sid in students) {
+    if (!students.hasOwnProperty(sid)) continue;
+    if (students[sid].summary_token && students[sid].summary_token === token) return students[sid];
+  }
+  return null;
+}
+
+/** One student's sessions and summary count on one local day. */
+function studentDay_(studentId, date) {
+  var events = groupByStudent_(resolveEvents_(readTable_(TAB_EVENTS)))[studentId] || [];
+  var all = buildSessions_(events);
+  var sessions = [];
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].date !== date) continue;
+    sessions.push({
+      status: all[i].status,
+      in_time: all[i].in_time,
+      out_time: all[i].out_time,
+      in_clock: all[i].in_clock,
+      out_clock: all[i].out_clock,
+      minutes: all[i].minutes,
+      flagged: all[i].flagged
+    });
+  }
+  var summaries = resolveSummaries_(readTable_(TAB_SUMMARIES));
+  var already = 0;
+  for (var s = 0; s < summaries.length; s++) {
+    if (normId_(summaries[s].student_id) !== studentId) continue;
+    if (summaryDate_(summaries[s]) === date) already++;
+  }
+  return { sessions: sessions, summaries_on_date: already };
 }
 
 /**
@@ -1191,7 +1413,18 @@ function summaryDate_(row) {
  * round-trip would stall the tablet at the door.
  */
 function actionSubmitSummary_(p) {
-  var studentId = requireId_(p.student_id);
+  // Either identifier works. A student who followed their emailed link sends a
+  // token and never learns their own ID; one who scanned or typed it in sends
+  // the ID, exactly as before.
+  var token = String(p.token || p.t || '').trim();
+  var studentId;
+  if (token) {
+    var byToken = studentByToken_(readTable_(TAB_STUDENTS), token);
+    if (!byToken) fail_('that summary link is not valid — ask a coach for a new one');
+    studentId = byToken.student_id;
+  } else {
+    studentId = requireId_(p.student_id);
+  }
   var text = requireStr_(p, 'text', MAX_SUMMARY_CHARS);
   var photos = p.photos || [];
   if (!(photos instanceof Array)) fail_('photos must be an array');
@@ -1233,13 +1466,22 @@ function actionSubmitSummary_(p) {
     appendRows_(TAB_SUMMARIES, [[
       row.summary_id, studentId, sessionDate, text, urls.join(', '), row.submitted_at
     ]]);
+
+    // A late summary heals its own rejection. The nightly job rejected these
+    // for the absence of exactly the row we just wrote, so waiting for the next
+    // run — or for a coach to notice — would leave a student staring at hours
+    // marked rejected minutes after they did the thing that fixes it.
+    var recovered = recoverRejectedFor_(studentId, sessionDate);
+
     return ok_({
       summary_id: row.summary_id,
       student_id: studentId,
       name: student.name,
       session_date: sessionDate,
       photo_urls: urls,
-      submitted_at: row.submitted_at
+      submitted_at: row.submitted_at,
+      recovered_sessions: recovered.sessions,
+      recovered_minutes: recovered.minutes
     });
   });
 }
@@ -1288,6 +1530,43 @@ function extForMime_(mime) {
   if (/heic|heif/i.test(mime)) return '.heic';
   if (/gif/i.test(mime)) return '.gif';
   return '.jpg';
+}
+
+/**
+ * Flip every rejected event of one student on one local day back to recovered.
+ *
+ * Caller must hold the lock. Returns what it changed so the response can say so.
+ */
+function recoverRejectedFor_(studentId, date) {
+  var raw = readTable_(TAB_EVENTS);
+  var rowOf = rawRowIndex_(raw);
+  var all = buildSessions_(groupByStudent_(resolveEvents_(raw, true))[studentId] || []);
+
+  var updates = [];
+  var count = 0;
+  var minutes = 0;
+  for (var i = 0; i < all.length; i++) {
+    var sess = all[i];
+    if (sess.date !== date || sess.event_status !== STATUS_REJECTED) continue;
+    var ids = [sess.in_event_id, sess.out_event_id];
+    for (var k = 0; k < ids.length; k++) {
+      if (ids[k] && rowOf[ids[k]]) updates.push({ _row: rowOf[ids[k]], status: STATUS_RECOVERED });
+    }
+    count++;
+    if (typeof sess.minutes === 'number') minutes += sess.minutes;
+  }
+  setEventStatuses_(updates);
+  return { sessions: count, minutes: minutes };
+}
+
+/** event_id -> the 1-based sheet row it lives on, for in-place status writes. */
+function rawRowIndex_(rawRows) {
+  var by = {};
+  for (var i = 0; i < rawRows.length; i++) {
+    var id = String(rawRows[i].event_id || '').trim();
+    if (id) by[id] = rawRows[i]._row;
+  }
+  return by;
 }
 
 /** The Drive folder from Config, falling back to a lookup and finally a create. */
@@ -1346,10 +1625,13 @@ function actionGetRoster_(p) {
     if (!students.hasOwnProperty(sid)) continue;
     var s = students[sid];
     if (!s.active && !includeInactive) continue;
-    // Four columns in slim mode, literally: created_at is on the record but no
-    // view has ever drawn it.
+    // Five columns in slim mode: created_at is on the record but no view has
+    // ever drawn it, and summary_token is private to the student. email IS
+    // here — the admin roster shows and edits it, and a second round trip to
+    // fetch one short string per student would be silly.
     var entry = slim
-      ? { student_id: s.student_id, name: s.name, grade: s.grade, active: s.active }
+      ? { student_id: s.student_id, name: s.name, grade: s.grade,
+          active: s.active, email: s.email }
       : publicStudent_(s);
     if (!slim) {
       var events = byStudent[sid] || [];
@@ -1383,9 +1665,14 @@ function actionGetTimesheet_(p) {
   // Opt-in, so an older deployed page that has not asked for it keeps getting
   // the full shape. The admin page asks.
   var slim = truthy_(p.slim);
+  // Also opt-in. Rejected sessions are excluded from the log by resolveEvents_,
+  // which is what makes every total correct by construction — so the Rejected
+  // Hours view has to ask for them back explicitly. Each row carries
+  // event_status, and everything summed below still skips the rejected ones.
+  var includeRejected = truthy_(p.include_rejected);
 
   var students = studentIndex_(readTable_(TAB_STUDENTS));
-  var byStudent = groupByStudent_(resolveEvents_(readTable_(TAB_EVENTS)));
+  var byStudent = groupByStudent_(resolveEvents_(readTable_(TAB_EVENTS), includeRejected));
 
   var sessions = [];
   var totals = [];
@@ -1413,7 +1700,7 @@ function actionGetTimesheet_(p) {
       sessions.push(s);
     }
     if (inRange.length && !slim) {
-      var stats = summarize_(inRange);
+      var stats = summarize_(countable_(inRange));
       totals.push({
         student_id: sid,
         name: student ? student.name : '(not on roster)',
@@ -1433,8 +1720,9 @@ function actionGetTimesheet_(p) {
   });
   totals.sort(function (a, b) { return b.total_minutes - a.total_minutes; });
 
-  var grandMinutes = 0, flagged = 0, review = 0;
+  var grandMinutes = 0, flagged = 0, review = 0, rejected = 0;
   for (var j = 0; j < sessions.length; j++) {
+    if (sessions[j].event_status === STATUS_REJECTED) { rejected++; continue; }
     if (sessions[j].status === 'closed') grandMinutes += sessions[j].minutes;
     if (sessions[j].flagged) flagged++;
     if (sessions[j].needs_review) review++;
@@ -1451,8 +1739,22 @@ function actionGetTimesheet_(p) {
     total_hours: Math.round(grandMinutes / 6) / 10,
     flagged_sessions: flagged,
     sessions_needing_review: review,
+    rejected_sessions: rejected,
+    includes_rejected: includeRejected,
+    // So the Rejected Hours view can state the actual rule rather than a
+    // number hard-coded in a second place that drifts from the Config tab.
+    grace_period_hours: cfgNum_('grace_period_hours', 24),
     generated_at: nowIso_()
   });
+}
+
+/** Drop rejected sessions. The counterpart of the filter in resolveEvents_. */
+function countable_(sessions) {
+  var out = [];
+  for (var i = 0; i < sessions.length; i++) {
+    if (sessions[i].event_status !== STATUS_REJECTED) out.push(sessions[i]);
+  }
+  return out;
 }
 
 /** One student: profile, stats, sessions, raw event log, summaries. */
@@ -1805,6 +2107,208 @@ function actionSetName_(p) {
   });
 }
 
+/**
+ * Write a whole session by hand: a student, a date, a start and an end.
+ *
+ * This is for the evening the tablet was unplugged, or the student who left
+ * their card at home — cases where there is no event to correct because there
+ * was never a scan at all, so editEvent has nothing to supersede.
+ *
+ * It appends a matched IN/OUT pair with source "manual". Both rows are flagged:
+ * the times came from a human's memory, and the admin UI should say so.
+ *
+ * Three checks, in the order a coach hits them:
+ *   - end after start, so nothing can produce a negative duration
+ *   - no overlap with a session that student already has, so a hand-entered
+ *     evening cannot be double-counted on top of the scans that recorded it
+ *   - under max_session_minutes from Config, the same ceiling the nightly
+ *     auto-close applies, so the manual path is not a way around it
+ *
+ * Manual sessions are exempt from summary rejection — see
+ * rejectUnloggedSessions().
+ */
+function actionAddManualSession_(p) {
+  requirePin_(p);
+  var studentId = requireId_(p.student_id);
+  var date = String(p.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) fail_('date must be YYYY-MM-DD');
+  var startHm = String(p.start || p.start_time || '').trim();
+  var endHm   = String(p.end || p.end_time || '').trim();
+  if (!/^\d{1,2}:\d{2}$/.test(startHm)) fail_('start must look like "16:30"');
+  if (!/^\d{1,2}:\d{2}$/.test(endHm)) fail_('end must look like "19:00"');
+  var reason = String(p.reason || p.note || '').trim();
+
+  // Same convention as localTimeOn_ elsewhere in this file: build the instant
+  // from the calendar day plus a wall-clock time, so "16:30 on the 4th" means
+  // what a coach means by it.
+  var ref = new Date(date.replace(/-/g, '/') + ' 12:00:00');
+  if (isNaN(ref.getTime())) fail_('could not read the date "' + date + '"');
+  var startAt = localTimeOn_(ref, startHm);
+  var endAt   = localTimeOn_(ref, endHm);
+  if (!startAt || !endAt) fail_('could not read those times');
+  if (endAt.getTime() <= startAt.getTime()) fail_('the end time must be after the start time');
+
+  var minutes = minutesBetween_(startAt, endAt);
+  var maxMinutes = cfgNum_('max_session_minutes', 360);
+  if (minutes > maxMinutes) {
+    fail_('that is ' + minutes + ' minutes; the maximum session is ' + maxMinutes +
+          ' (change max_session_minutes in the Config tab to allow longer)');
+  }
+
+  return withLock_(function () {
+    var students = studentIndex_(readTable_(TAB_STUDENTS));
+    var student = students[studentId];
+    if (!student) fail_('no student with id ' + studentId);
+
+    var raw = readTable_(TAB_EVENTS);
+    // Overlap is checked against rejected sessions too. A rejected session is
+    // still a record of the student being in the lab; letting a coach type a
+    // duplicate over one would double-count it the moment a late summary
+    // recovered the original.
+    var mine = groupByStudent_(resolveEvents_(raw, true))[studentId] || [];
+    var existing = buildSessions_(mine);
+    var now = new Date();
+    for (var i = 0; i < existing.length; i++) {
+      var e = existing[i];
+      if (!e.in_time) continue;                       // an orphan OUT spans nothing
+      var a = new Date(e.in_time).getTime();
+      var b = e.out_time ? new Date(e.out_time).getTime() : now.getTime();
+      if (startAt.getTime() < b && endAt.getTime() > a) {
+        fail_(student.name + ' already has a session on ' + e.date + ' from ' +
+              e.in_clock + ' to ' + (e.out_clock || 'now') + ' that overlaps this one');
+      }
+    }
+
+    var note = 'manual entry by a coach' + (reason ? ' — ' + reason : '');
+    var inEv = {
+      event_id: newId_('evt'), student_id: studentId, timestamp: toIso_(startAt),
+      direction: DIR_IN, source: SOURCE_MANUAL, flagged: true, note: note,
+      status: STATUS_ACTIVE
+    };
+    var outEv = {
+      event_id: newId_('evt'), student_id: studentId, timestamp: toIso_(endAt),
+      direction: DIR_OUT, source: SOURCE_MANUAL, flagged: true, note: note,
+      status: STATUS_ACTIVE
+    };
+    appendRows_(TAB_EVENTS, [eventRow_(inEv), eventRow_(outEv)]);
+
+    return ok_({
+      student_id: studentId, name: student.name, date: date,
+      in_event_id: inEv.event_id, out_event_id: outEv.event_id,
+      in_time: inEv.timestamp, out_time: outEv.timestamp, minutes: minutes,
+      sessions: studentSessionsAfter_(raw, [inEv, outEv], studentId)
+    });
+  });
+}
+
+/**
+ * Add or correct a student's email.
+ *
+ * Like `name` and `active`, this is roster data: the event log stores only
+ * student_id, so changing an address moves no hour and no session. It exists
+ * because collection is optional at the tablet — a student who skipped the
+ * field, or typed it wrong with a queue behind them, has to be fixable later
+ * without re-enrolling them.
+ *
+ * Passing an empty string clears the address, which stops the scan-out emails.
+ * A student with no token gets one here, so an address added to a row that
+ * predates tokens is immediately usable.
+ */
+function actionSetEmail_(p) {
+  requirePin_(p);
+  var studentId = requireId_(p.student_id);
+  var email = normEmail_(p.email);
+
+  return withLock_(function () {
+    var students = studentIndex_(readTable_(TAB_STUDENTS));
+    var student = students[studentId];
+    if (!student) fail_('no student with id ' + studentId);
+
+    var previous = student.email;
+    var sh = sheet_(TAB_STUDENTS);
+    var touched = false;
+    if (email !== previous) {
+      sh.getRange(student._row, COL_STUDENT_EMAIL).setValue(email);
+      student.email = email;
+      touched = true;
+    }
+    if (email && !student.summary_token) {
+      student.summary_token = newToken_();
+      sh.getRange(student._row, COL_STUDENT_TOKEN).setValue(student.summary_token);
+      touched = true;
+    }
+    if (touched) invalidateTable_(TAB_STUDENTS);   // in place, so not via appendRows_
+
+    return ok_({ student_id: studentId, name: student.name, email: email,
+                 previous_email: previous, changed: email !== previous,
+                 student: publicStudent_(student) });
+  });
+}
+
+/**
+ * Put rejected sessions back into the count, on a coach's say-so.
+ *
+ * Takes the event ids of the sessions to restore — both ends of each — so the
+ * "Recover selected" button is one request no matter how many rows are ticked.
+ * Recovery is idempotent: an id that is already active or recovered is counted
+ * as a no-op rather than an error, because a double-click on a bulk action
+ * should not produce a failure a coach has to interpret.
+ */
+function actionRecoverEvents_(p) {
+  requirePin_(p);
+  var ids = p.event_ids || p.eventIds;
+  if (!(ids instanceof Array) || !ids.length) fail_('recoverEvents needs a non-empty event_ids array');
+  if (ids.length > 1000) fail_('too many events in one request (max 1000)');
+
+  return withLock_(function () {
+    var raw = readTable_(TAB_EVENTS);
+    var rowOf = rawRowIndex_(raw);
+    var statusOf = {};
+    var ownerOf = {};
+    for (var r = 0; r < raw.length; r++) {
+      var rid = String(raw[r].event_id || '').trim();
+      if (!rid) continue;
+      statusOf[rid] = normStatus_(raw[r].status);
+      ownerOf[rid] = normId_(raw[r].student_id);
+    }
+
+    var updates = [];
+    var recovered = [];
+    var skipped = [];
+    var seen = {};
+    for (var i = 0; i < ids.length; i++) {
+      var id = String(ids[i] || '').trim();
+      if (!id || seen[id]) continue;
+      seen[id] = true;
+      if (!rowOf[id]) { skipped.push({ event_id: id, reason: 'no such event' }); continue; }
+      if (statusOf[id] !== STATUS_REJECTED) {
+        skipped.push({ event_id: id, reason: 'not rejected' });
+        continue;
+      }
+      updates.push({ _row: rowOf[id], status: STATUS_RECOVERED });
+      recovered.push(id);
+    }
+    setEventStatuses_(updates);
+
+    // The caller's whole point is that these hours count again, and only the
+    // server knows how the restored events re-pair. Hand back every affected
+    // student's rebuilt timeline rather than making the page re-fetch.
+    var byStudent = {};
+    for (var u = 0; u < recovered.length; u++) {
+      if (ownerOf[recovered[u]]) byStudent[ownerOf[recovered[u]]] = true;
+    }
+    var fresh = readTable_(TAB_EVENTS);
+    var sessionsByStudent = {};
+    for (var sid in byStudent) {
+      if (!byStudent.hasOwnProperty(sid)) continue;
+      sessionsByStudent[sid] = studentSessionsAfter_(fresh, [], sid);
+    }
+
+    return ok_({ recovered: recovered, skipped: skipped,
+                 sessions_by_student: sessionsByStudent });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Setup — run these by hand from the Apps Script editor
 // ---------------------------------------------------------------------------
@@ -1818,7 +2322,8 @@ function initializeSheets() {
   return withLock_(function () {
     CONFIG_CACHE = null;
     var ss = ss_();
-    var report = { created_tabs: [], repaired_headers: [], config_added: [], notes: [] };
+    var report = { created_tabs: [], repaired_headers: [], columns_added: [],
+                   config_added: [], tokens_backfilled: 0, notes: [] };
 
     var tabs = [TAB_STUDENTS, TAB_EVENTS, TAB_SUMMARIES, TAB_CONFIG];
     for (var i = 0; i < tabs.length; i++) {
@@ -1833,28 +2338,49 @@ function initializeSheets() {
       var current = sh.getLastColumn()
         ? sh.getRange(1, 1, 1, Math.max(sh.getLastColumn(), header.length)).getValues()[0]
         : [];
+
+      // Two very different situations, and they must not be reported the same
+      // way. A tab whose existing columns match the start of the contract and
+      // is simply MISSING the ones added later is a routine migration: writing
+      // the header row adds the new names and leaves every data row alone, with
+      // the new cells blank, which is exactly what the readers expect. A tab
+      // whose columns disagree somewhere in the MIDDLE means somebody reordered
+      // them, and rewriting row 1 there relabels real data — so that one gets
+      // shouted about.
+      var appendedOnly = true;
       var needsHeader = false;
+      var added = [];
       for (var c = 0; c < header.length; c++) {
-        if (String(current[c] || '').trim().toLowerCase() !== header[c]) { needsHeader = true; break; }
+        var cell = String(current[c] === undefined || current[c] === null ? '' : current[c]).trim().toLowerCase();
+        if (cell === header[c]) continue;
+        needsHeader = true;
+        if (cell === '') added.push(header[c]);
+        else appendedOnly = false;
       }
       if (needsHeader) {
-        if (sh.getLastRow() > 1) {
+        if (sh.getLastRow() > 1 && !appendedOnly) {
           report.notes.push('tab "' + name + '" has data but wrong headers — headers rewritten, ' +
                             'CHECK that the existing columns line up with ' + header.join(', '));
         }
         sh.getRange(1, 1, 1, header.length).setValues([header]);
         report.repaired_headers.push(name);
+        for (var a = 0; a < added.length; a++) report.columns_added.push(name + '.' + added[a]);
       }
       sh.getRange(1, 1, 1, header.length).setFontWeight('bold');
       sh.setFrozenRows(1);
     }
+    // Everything below reads these tabs back through readTable_, which checks
+    // the header row it just wrote. Push the writes out first so the migration
+    // cannot read its own stale "column F is empty".
+    SpreadsheetApp.flush();
 
     // Text formatting where Sheets would otherwise "helpfully" coerce values:
     // 7-digit IDs must not become numbers (leading zeros) and ISO timestamps
     // must not become spreadsheet dates.
     sheet_(TAB_STUDENTS).getRange('A:A').setNumberFormat('@');
-    sheet_(TAB_STUDENTS).getRange('E:E').setNumberFormat('@');
+    sheet_(TAB_STUDENTS).getRange('E:G').setNumberFormat('@');   // created_at, email, summary_token
     sheet_(TAB_EVENTS).getRange('B:C').setNumberFormat('@');
+    sheet_(TAB_EVENTS).getRange('H:H').setNumberFormat('@');     // status
     sheet_(TAB_SUMMARIES).getRange('B:C').setNumberFormat('@');
     sheet_(TAB_SUMMARIES).getRange('F:F').setNumberFormat('@');
     sheet_(TAB_CONFIG).getRange('B:B').setNumberFormat('@');
@@ -1894,12 +2420,23 @@ function initializeSheets() {
       max_session_minutes: '360',
       scan_debounce_seconds: '15',
       timezone: Session.getScriptTimeZone(),
-      drive_folder_id: folder.getId()
+      drive_folder_id: folder.getId(),
+      // How long after scanning out a student has to submit a summary before
+      // that session stops counting. Read by rejectUnloggedSessions() and
+      // quoted in the scan-out email, so both always agree.
+      grace_period_hours: '24',
+      // The public URL of summary.html. Left empty on purpose: only you know
+      // where this repo is published, and a wrong link in a student's inbox is
+      // worse than no email. Until it is set, scan-out emails are not sent and
+      // flushSummaryEmails says so in the log.
+      summary_base_url: ''
     };
     var newRows = [];
     for (var k in defaults) {
       if (!defaults.hasOwnProperty(k)) continue;
-      if (existingCfg[k]) continue;
+      // hasOwnProperty, not truthiness: summary_base_url ships empty, and a
+      // falsiness check would append a duplicate row on every run.
+      if (existingCfg.hasOwnProperty(k)) continue;
       newRows.push([k, defaults[k]]);
       report.config_added.push(k);
     }
@@ -1915,6 +2452,30 @@ function initializeSheets() {
     appendRows_(TAB_CONFIG, newRows);
     CONFIG_CACHE = null;
 
+    // --- Backfill summary tokens for students enrolled before tokens existed.
+    // One read and one write of column G, never touching any other cell. A row
+    // that already has a token keeps it: the link may already be in an inbox.
+    var studentRows = readTable_(TAB_STUDENTS);
+    if (studentRows.length) {
+      var lastStudentRow = 0;
+      for (var sr = 0; sr < studentRows.length; sr++) {
+        if (studentRows[sr]._row > lastStudentRow) lastStudentRow = studentRows[sr]._row;
+      }
+      var tokenRange = sheet_(TAB_STUDENTS).getRange(2, COL_STUDENT_TOKEN, lastStudentRow - 1, 1);
+      var tokens = tokenRange.getValues();
+      var minted = 0;
+      for (var t = 0; t < tokens.length; t++) {
+        if (String(tokens[t][0] || '').trim()) continue;
+        tokens[t][0] = newToken_();
+        minted++;
+      }
+      if (minted) {
+        tokenRange.setValues(tokens);
+        invalidateTable_(TAB_STUDENTS);
+        report.tokens_backfilled = minted;
+      }
+    }
+
     report.drive_folder = { name: folder.getName(), id: folder.getId(), url: folder.getUrl() };
     report.admin_pin = existingCfg.admin_pin || defaults.admin_pin;
     report.spreadsheet_url = ss.getUrl();
@@ -1922,26 +2483,42 @@ function initializeSheets() {
     Logger.log('--- Robotics Lab Attendance: initializeSheets ---');
     Logger.log('Tabs created:      ' + (report.created_tabs.join(', ') || 'none (already existed)'));
     Logger.log('Headers written:   ' + (report.repaired_headers.join(', ') || 'none'));
+    Logger.log('Columns added:     ' + (report.columns_added.join(', ') || 'none'));
     Logger.log('Config keys added: ' + (report.config_added.join(', ') || 'none'));
+    Logger.log('Tokens backfilled: ' + report.tokens_backfilled);
     Logger.log('Drive folder:      ' + folder.getName() + '  ' + folder.getUrl());
     Logger.log('ADMIN PIN:         ' + report.admin_pin + '   (Config tab, key admin_pin — change it there)');
     for (var n = 0; n < report.notes.length; n++) Logger.log('Note: ' + report.notes[n]);
-    Logger.log('Next: run installAutoCloseTrigger(), then Deploy > New deployment > Web app.');
+    if (!cfgStr_('summary_base_url', '')) {
+      Logger.log('ACTION NEEDED:     Config summary_base_url is empty. Set it to the public URL of ' +
+                 'summary.html (e.g. https://<user>.github.io/<repo>/summary.html) or no scan-out ' +
+                 'emails will be sent.');
+    }
+    Logger.log('Next: run installNightlyTrigger() and installSummaryEmailTrigger(), ' +
+               'then Deploy > New deployment > Web app.');
 
     return report;
   });
 }
 
 /**
- * Install the nightly auto-close trigger. Idempotent — removes any trigger it
- * previously installed before adding the new one. Run again after changing
- * lab_close in Config.
+ * Install the nightly trigger, on nightlyMaintenance().
+ *
+ * It removes any trigger on the OLD handler, autoCloseOpenSessions, as well as
+ * its own. An installation that predates the rejection feature has a trigger
+ * pointing straight at autoCloseOpenSessions; leaving it in place would run the
+ * closer twice a night, once outside the chain that guarantees rejection runs
+ * after it. Run this once after pasting in this version.
+ *
+ * Idempotent — safe to run again after changing lab_close in Config.
  */
-function installAutoCloseTrigger() {
+function installNightlyTrigger() {
   var existing = ScriptApp.getProjectTriggers();
   var removed = 0;
   for (var i = 0; i < existing.length; i++) {
-    if (existing[i].getHandlerFunction() === 'autoCloseOpenSessions') {
+    var fn = existing[i].getHandlerFunction();
+    if (fn === 'nightlyMaintenance' || fn === 'autoCloseOpenSessions' ||
+        fn === 'rejectUnloggedSessions') {
       ScriptApp.deleteTrigger(existing[i]);
       removed++;
     }
@@ -1951,10 +2528,43 @@ function installAutoCloseTrigger() {
   // lab close itself, so the imprecision never lands in a student's hours.
   var close = cfgStr_('lab_close', '21:00');
   var hour = (parseInt(close.split(':')[0], 10) + 1) % 24;
-  ScriptApp.newTrigger('autoCloseOpenSessions').timeBased().atHour(hour).everyDays(1).create();
-  Logger.log('Auto-close trigger installed for ~' + hour + ':00 ' + tz_() +
+  ScriptApp.newTrigger('nightlyMaintenance').timeBased().atHour(hour).everyDays(1).create();
+  Logger.log('Nightly trigger installed on nightlyMaintenance() for ~' + hour + ':00 ' + tz_() +
              ' (removed ' + removed + ' previous)');
-  return { removed: removed, hour: hour, lab_close: close };
+  return { removed: removed, hour: hour, lab_close: close, handler: 'nightlyMaintenance' };
+}
+
+/**
+ * Kept so an older bookmark or a half-finished setup still works. It installs
+ * the same single nightly trigger as installNightlyTrigger() — never a bare
+ * autoCloseOpenSessions trigger, which would run outside the ordering the
+ * rejection job depends on.
+ */
+function installAutoCloseTrigger() {
+  return installNightlyTrigger();
+}
+
+/**
+ * Install the summary-email flusher. Every five minutes, which is how long a
+ * student might wait for the link after scanning out.
+ *
+ * This is a SEPARATE trigger from the nightly one on purpose: the scan path
+ * only queues, so nothing sends until this runs, and holding the mail until
+ * midnight would email students about a deadline most of the way through their
+ * grace period. Idempotent.
+ */
+function installSummaryEmailTrigger() {
+  var existing = ScriptApp.getProjectTriggers();
+  var removed = 0;
+  for (var i = 0; i < existing.length; i++) {
+    if (existing[i].getHandlerFunction() === 'flushSummaryEmails') {
+      ScriptApp.deleteTrigger(existing[i]);
+      removed++;
+    }
+  }
+  ScriptApp.newTrigger('flushSummaryEmails').timeBased().everyMinutes(5).create();
+  Logger.log('Summary email trigger installed, every 5 minutes (removed ' + removed + ' previous)');
+  return { removed: removed, every_minutes: 5 };
 }
 
 // ---------------------------------------------------------------------------
@@ -1981,6 +2591,7 @@ function autoCloseOpenSessions() {
 
     var rows = [];
     var closed = [];
+    var newIds = [];
     for (var sid in byStudent) {
       if (!byStudent.hasOwnProperty(sid)) continue;
       var events = byStudent[sid];
@@ -2014,8 +2625,10 @@ function autoCloseOpenSessions() {
               'session shown as ' + Math.max(0, minutesBetween_(last.ts, outTs)) + ' min, verify before counting'
       };
       rows.push(eventRow_(ev));
+      newIds.push(ev.event_id);
       closed.push({
         student_id: sid,
+        event_id: ev.event_id,
         name: students[sid] ? students[sid].name : '(not on roster)',
         in_time: last.timestamp,
         out_time: ev.timestamp,
@@ -2030,8 +2643,298 @@ function autoCloseOpenSessions() {
       Logger.log('  ' + closed[i].name + '  ' + closed[i].in_time + ' -> ' + closed[i].out_time +
                  '  (' + closed[i].minutes + ' min, ' + closed[i].reason + ')');
     }
-    return { closed: closed.length, sessions: closed, ran_at: nowIso_() };
+    return { closed: closed.length, sessions: closed, event_ids: newIds, ran_at: nowIso_() };
   });
+}
+
+
+
+/**
+ * The nightly job. ONE trigger runs this; it runs the two steps in order.
+ *
+ * Ordering is not cosmetic. rejectUnloggedSessions only looks at COMPLETED
+ * sessions, so a student still checked in is invisible to it — if rejection ran
+ * first, the session autoCloseOpenSessions is about to close would be skipped
+ * tonight and only judged tomorrow. Chaining them here makes the order a
+ * property of the code rather than of how two triggers happened to be
+ * scheduled, which is why installNightlyTrigger() installs this and not the
+ * two functions separately.
+ *
+ * The second half is also told which OUT events the first half just invented.
+ * An auto-closed OUT is BACKDATED to lab close, so measuring the grace period
+ * from its timestamp would start the clock before the row existed — with a
+ * short grace_period_hours a student could be rejected in the same run that
+ * closed them, for failing to write a summary about a session that was not
+ * over yet. Those sessions sit out tonight and get judged on the next run,
+ * which guarantees the full grace period no matter how it is configured.
+ */
+function nightlyMaintenance() {
+  var closedResult = autoCloseOpenSessions();
+  var rejectResult = rejectUnloggedSessions({ skipEventIds: closedResult.event_ids || [] });
+  return { auto_close: closedResult, rejection: rejectResult, ran_at: nowIso_() };
+}
+
+/**
+ * Reject completed sessions that nobody wrote up.
+ *
+ * A session is rejected when all of these hold:
+ *   - it is a clean, closed IN/OUT pair (a broken session is a review problem,
+ *     not a policy problem, and is already surfaced in Needs review)
+ *   - its check-out is older than grace_period_hours
+ *   - the student has no summary in the sheet for that session's local day
+ *   - it was not typed in by a coach — source "manual" is exempt, because a
+ *     coach entering a session by hand IS the verification a summary provides
+ *
+ * Rejection sets status = "rejected" on BOTH ends, together, so the pair still
+ * resolves as a pair and resolveEvents_ can drop it whole. Nothing is deleted
+ * and no timestamp changes: the rows stay in the sheet exactly as written, and
+ * a late summary — or a coach with the Recover button — puts them straight back.
+ *
+ * Idempotent. A session already rejected or recovered is left alone, so
+ * re-running this never re-rejects hours a coach deliberately restored.
+ */
+function rejectUnloggedSessions(opts) {
+  opts = opts || {};
+  var skip = {};
+  var skipList = opts.skipEventIds || [];
+  for (var q = 0; q < skipList.length; q++) skip[skipList[q]] = true;
+
+  return withLock_(function () {
+    var graceHours = cfgNum_('grace_period_hours', 24);
+    var cutoff = Date.now() - graceHours * 3600000;
+
+    var raw = readTable_(TAB_EVENTS);
+    var rowOf = rawRowIndex_(raw);
+    var students = studentIndex_(readTable_(TAB_STUDENTS));
+    var byStudent = groupByStudent_(resolveEvents_(raw, true));
+
+    // student|date of every summary on file, so the check below is a lookup.
+    var logged = {};
+    var summaryRows = resolveSummaries_(readTable_(TAB_SUMMARIES));
+    for (var i = 0; i < summaryRows.length; i++) {
+      var sid0 = normId_(summaryRows[i].student_id);
+      if (sid0) logged[sid0 + '|' + summaryDate_(summaryRows[i])] = true;
+    }
+
+    var updates = [];
+    var rejected = [];
+    for (var sid in byStudent) {
+      if (!byStudent.hasOwnProperty(sid)) continue;
+      var sessions = buildSessions_(byStudent[sid]);
+      for (var j = 0; j < sessions.length; j++) {
+        var sess = sessions[j];
+        if (sess.status !== 'closed') continue;
+        if (sess.event_status !== STATUS_ACTIVE) continue;        // already judged
+        if ((sess.sources || []).indexOf(SOURCE_MANUAL) >= 0) continue;
+        if (skip[sess.out_event_id] || skip[sess.in_event_id]) continue;
+        if (new Date(sess.out_time).getTime() > cutoff) continue; // still in grace
+        if (logged[sid + '|' + sess.date]) continue;              // written up
+
+        if (rowOf[sess.in_event_id])  updates.push({ _row: rowOf[sess.in_event_id],  status: STATUS_REJECTED });
+        if (rowOf[sess.out_event_id]) updates.push({ _row: rowOf[sess.out_event_id], status: STATUS_REJECTED });
+        rejected.push({
+          student_id: sid,
+          name: students[sid] ? students[sid].name : '(not on roster)',
+          date: sess.date,
+          minutes: sess.minutes,
+          in_time: sess.in_time,
+          out_time: sess.out_time
+        });
+      }
+    }
+
+    var changed = setEventStatuses_(updates);
+    Logger.log('rejectUnloggedSessions: rejected ' + rejected.length + ' session(s) past a ' +
+               graceHours + 'h grace period (' + changed + ' event rows updated)');
+    for (var k = 0; k < rejected.length; k++) {
+      Logger.log('  ' + rejected[k].name + '  ' + rejected[k].date + '  ' + rejected[k].minutes + ' min');
+    }
+    return { rejected: rejected.length, sessions: rejected,
+             grace_period_hours: graceHours, ran_at: nowIso_() };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Summary emails
+//
+// When a student scans out, they get their own summary link by email. Two
+// things shape how this is built.
+//
+// 1. THE SCAN MUST NOT WAIT. A student is standing at a wall tablet with a
+//    queue behind them. MailApp.sendEmail takes hundreds of milliseconds and
+//    can fail outright, and Apps Script has no way to fire and forget inside a
+//    request. So actionScan_ appends one entry to a queue in ScriptProperties
+//    — a single fast write, after the lock is released — and returns. A
+//    separate flushSummaryEmails trigger sends them a few minutes later.
+//
+// 2. THE QUOTA IS SMALL AND SHARED. MailApp allows 100 recipients a day on a
+//    consumer Gmail account (1,500 on Workspace), counted across everything
+//    the account sends. A team of 30 scanning out twice on a build weekend
+//    will get close. The flusher checks the remaining quota before every send,
+//    warns in the log as it runs low, and when it hits zero it stops and LEAVES
+//    the rest queued for tomorrow rather than throwing them away. Nothing here
+//    can break a scan, because nothing here runs during one.
+// ---------------------------------------------------------------------------
+
+/**
+ * Append one pending email. Called after the scan's lock is released.
+ *
+ * Every failure path is swallowed: a scan that recorded a student's hours has
+ * already succeeded, and losing the courtesy email is not a reason to tell
+ * them their check-out failed.
+ */
+function queueSummaryEmail_(item) {
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var queue = readMailQueue_(props);
+    item.queued_at = nowIso_();
+    queue.push(item);
+    if (queue.length > MAIL_QUEUE_MAX) queue = queue.slice(queue.length - MAIL_QUEUE_MAX);
+    props.setProperty(MAIL_QUEUE_KEY, JSON.stringify(queue));
+  } catch (err) {
+    console.warn('could not queue the summary email: ' + err);
+  }
+}
+
+function readMailQueue_(props) {
+  try {
+    var raw = props.getProperty(MAIL_QUEUE_KEY);
+    if (!raw) return [];
+    var parsed = JSON.parse(raw);
+    return parsed instanceof Array ? parsed : [];
+  } catch (err) {
+    console.warn('summary mail queue was unreadable, discarding it: ' + err);
+    return [];
+  }
+}
+
+/**
+ * Send everything queued. Runs on its own frequent trigger — see
+ * installSummaryEmailTrigger().
+ *
+ * The queue is claimed under the script lock and emptied before the first send,
+ * so a second flush that overlaps this one cannot send the same mail twice.
+ * Anything that could not go out is written back at the end.
+ */
+function flushSummaryEmails() {
+  var props = PropertiesService.getScriptProperties();
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    Logger.log('flushSummaryEmails: sheet is busy, leaving the queue for the next run');
+    return { sent: 0, skipped: 0, remaining: null };
+  }
+  var batch;
+  try {
+    batch = readMailQueue_(props);
+    props.deleteProperty(MAIL_QUEUE_KEY);
+  } finally {
+    lock.releaseLock();
+  }
+  if (!batch.length) return { sent: 0, skipped: 0, remaining: 0 };
+
+  var base = cfgStr_('summary_base_url', '');
+  if (!base) {
+    Logger.log('flushSummaryEmails: Config summary_base_url is empty, so there is no link ' +
+               'to send — dropping ' + batch.length + ' queued email(s). Set it to the public ' +
+               'URL of summary.html, e.g. https://<user>.github.io/<repo>/summary.html');
+    return { sent: 0, skipped: batch.length, remaining: 0 };
+  }
+
+  var quota = mailQuota_();
+  if (quota <= MAIL_QUOTA_WARN) {
+    console.warn('MailApp daily quota is down to ' + quota + ' recipients');
+  }
+
+  var cutoff = Date.now() - MAIL_MAX_AGE_MS;
+  var sent = 0, skipped = 0;
+  var leftover = [];
+
+  for (var i = 0; i < batch.length; i++) {
+    var item = batch[i] || {};
+    var queuedMs = new Date(item.queued_at || 0).getTime();
+    if (!item.to || !item.token) { skipped++; continue; }
+    // A day-old reminder to log hours that were already rejected is noise.
+    if (queuedMs && queuedMs < cutoff) { skipped++; continue; }
+
+    if (quota <= 0) {
+      // Out of quota: keep the rest for tomorrow rather than dropping them.
+      leftover.push(item);
+      continue;
+    }
+    try {
+      MailApp.sendEmail(summaryEmail_(item, base));
+      quota--;
+      sent++;
+    } catch (err) {
+      console.error('could not send the summary email to ' + item.to + ': ' + err);
+      skipped++;
+    }
+  }
+
+  if (leftover.length) {
+    // Merge with anything queued while we were sending.
+    var lock2 = LockService.getScriptLock();
+    if (lock2.tryLock(10000)) {
+      try {
+        props.setProperty(MAIL_QUEUE_KEY, JSON.stringify(readMailQueue_(props).concat(leftover)));
+      } finally {
+        lock2.releaseLock();
+      }
+    }
+    console.warn('MailApp daily quota is exhausted — ' + leftover.length +
+                 ' summary email(s) held over until tomorrow');
+  }
+
+  Logger.log('flushSummaryEmails: sent ' + sent + ', skipped ' + skipped +
+             ', held ' + leftover.length + ', quota left ' + Math.max(0, quota));
+  return { sent: sent, skipped: skipped, remaining: leftover.length, quota_left: Math.max(0, quota) };
+}
+
+/** Remaining recipients today, or a pessimistic 0 if the check itself fails. */
+function mailQuota_() {
+  try {
+    return MailApp.getRemainingDailyQuota();
+  } catch (err) {
+    console.error('could not read the MailApp quota: ' + err);
+    return 0;
+  }
+}
+
+/** The message. Plain text: it is read on a phone, on the way out the door. */
+function summaryEmail_(item, base) {
+  var link = base + (base.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(item.token);
+  var first = String(item.name || '').split(' ')[0] || 'there';
+  var grace = cfgNum_('grace_period_hours', 24);
+  var out = parseTs_(item.out_time) || new Date();
+  var deadline = new Date(out.getTime() + grace * 3600000);
+  var dur = item.minutes == null ? null : fmtMinutes_(item.minutes);
+  var day = Utilities.formatDate(out, tz_(), 'EEEE, MMMM d');
+  var by = Utilities.formatDate(deadline, tz_(), 'EEEE, MMMM d') + ' at ' +
+           Utilities.formatDate(deadline, tz_(), 'h:mm a');
+
+  var body =
+    'Hi ' + first + ',\n\n' +
+    'You logged ' + (dur ? dur : 'a session') + ' in the lab on ' + day + '.\n\n' +
+    'Write up what you worked on here:\n' + link + '\n\n' +
+    'The link is yours — it already knows who you are, so there is nothing to type in.\n\n' +
+    'Please submit it by ' + by + '. Lab time without a summary does not count ' +
+    'toward your hours.\n\n' +
+    'If you submit late, your hours come back automatically as soon as the summary lands.\n\n' +
+    '— Robotics lab hours';
+
+  return {
+    to: item.to,
+    subject: 'Log your lab hours for ' + day,
+    body: body,
+    name: 'Robotics Lab Hours'
+  };
+}
+
+function fmtMinutes_(m) {
+  if (m == null) return '';
+  if (m < 60) return m + ' minutes';
+  var h = Math.floor(m / 60), rest = m % 60;
+  return rest ? h + 'h ' + rest + 'm' : h + (h === 1 ? ' hour' : ' hours');
 }
 
 // ---------------------------------------------------------------------------
@@ -2068,6 +2971,32 @@ function smokeTest() {
   }
   step('bad pin (expect error)', { action: 'getRoster', pin: '000000' });
   step('bad id (expect error)', { action: 'scan', student_id: '12' });
+
+  // --- the newer features ---------------------------------------------------
+  step('set email', { action: 'setEmail', pin: pin, student_id: TEST_ID, email: 'test@example.com' });
+  step('bad email (expect error)', { action: 'setEmail', pin: pin, student_id: TEST_ID, email: 'nope' });
+
+  var token = '';
+  var rows = readTable_(TAB_STUDENTS);
+  for (var i = 0; i < rows.length; i++) {
+    if (normId_(rows[i].student_id) === TEST_ID) token = String(rows[i].summary_token || '');
+  }
+  Logger.log('token for the test student: ' + (token ? 'present' : 'MISSING — run initializeSheets()'));
+  if (token) step('lookup by token', { action: 'lookupToken', t: token, date: dateKey_(new Date()) });
+  step('lookup by a bogus token', { action: 'lookupToken', t: 'not-a-real-token-0000000000' });
+
+  step('manual session', { action: 'addManualSession', pin: pin, student_id: TEST_ID,
+                           date: dateKey_(new Date(Date.now() - 7 * 86400000)),
+                           start: '16:00', end: '18:00', reason: 'smoke test' });
+  step('manual session, overlapping (expect error)', { action: 'addManualSession', pin: pin,
+                           student_id: TEST_ID, date: dateKey_(new Date(Date.now() - 7 * 86400000)),
+                           start: '17:00', end: '19:00' });
+  step('manual session, backwards (expect error)', { action: 'addManualSession', pin: pin,
+                           student_id: TEST_ID, date: dateKey_(new Date()), start: '19:00', end: '17:00' });
+
+  step('timesheet including rejected', { action: 'getTimesheet', pin: pin, include_rejected: true });
+  Logger.log('rejectUnloggedSessions -> ' + JSON.stringify(rejectUnloggedSessions()));
+  Logger.log('MailApp quota left: ' + mailQuota_());
 
   return log;
 }

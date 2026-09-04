@@ -195,11 +195,22 @@ const JPEG_QUALITY = 0.8;
 
 const $ = (id) => document.getElementById(id);
 const state = {
-  student: null,               // {student_id, name, grade}
+  student: null,               // {student_id?, name, grade}
+  // Set when the page was opened from an emailed ?t=<token> link. It is the
+  // student's identity for the rest of the visit — the ID is never fetched,
+  // never displayed and never sent, because the point of the token is that a
+  // link in an inbox does not carry a working student ID around.
+  token: null,
   photos: [],                  // {name, dataUrl, bytes}
   scanner: null,
   busy: false,
 };
+
+/** Whoever we are acting as, in the shape submitSummary and the lookups want. */
+const who = () => (state.token ? { token: state.token } : state.student.student_id);
+const lookupWho = (date) => (state.token
+  ? api.lookupToken(state.token, date)
+  : api.lookupStudent(state.student.student_id, date));
 
 const todayKey = () => {
   const d = new Date();
@@ -284,7 +295,7 @@ function renderSessionNote(info) {
 async function refreshSessionNote() {
   if (!state.student) return;
   try {
-    const info = await api.lookupStudent(state.student.student_id, $('session-date').value);
+    const info = await lookupWho($('session-date').value);
     state.student = info;
     renderSessionNote(info);
   } catch (err) {
@@ -483,7 +494,7 @@ async function submit() {
 
   try {
     const result = await api.submitSummary(
-      state.student.student_id,
+      who(),
       text,
       state.photos.map((p) => ({ name: p.name, mimeType: 'image/jpeg', data: p.dataUrl })),
       date,
@@ -493,9 +504,16 @@ async function submit() {
     $('compose').hidden = true;
     $('done').hidden = false;
     $('done-name').textContent = state.student.name.split(' ')[0];
-    $('done-detail').textContent = result.photo_urls.length
+    const saved = result.photo_urls.length
       ? `Saved for ${date} with ${result.photo_urls.length} photo${result.photo_urls.length === 1 ? '' : 's'}.`
       : `Saved for ${date}.`;
+    // A late writeup un-rejects its own session server-side. Say so plainly:
+    // the student was told those hours had stopped counting, so "saved" alone
+    // does not answer the question they actually have.
+    $('done-detail').textContent = result.recovered_sessions
+      ? `${saved} Your ${result.recovered_sessions === 1 ? 'session' : 'sessions'} for that day ` +
+        `${result.recovered_sessions === 1 ? 'counts' : 'count'} again.`
+      : saved;
     window.scrollTo(0, 0);
   } catch (err) {
     hideProgress();
@@ -523,6 +541,7 @@ $('student-id').addEventListener('input', (e) => {
 });
 $('who-change').addEventListener('click', () => {
   state.student = null;
+  state.token = null;
   $('compose').hidden = true;
   $('identify').hidden = false;
   $('student-id').value = '';
@@ -552,8 +571,62 @@ $('again').addEventListener('click', () => {
 $('session-date').value = todayKey();
 $('session-date').max = todayKey();          // no summaries for days that have not happened
 
-const fromUrl = new URLSearchParams(location.search).get('id');
-if (fromUrl && isValidStudentId(fromUrl.trim())) {
+/**
+ * A student arriving from their scan-out email should have nothing to do but
+ * write. The token in ?t= resolves to them server-side, so the whole "who are
+ * you" step — the camera, the ID field, the lookup — is skipped and their name
+ * is shown back as confirmation instead.
+ *
+ * Everything else on the page is unchanged. A student who lost the email, never
+ * gave one, or is writing up a friend's session on a shared laptop still gets
+ * the scan and manual-entry paths below.
+ */
+async function identifyByToken(token) {
+  $('identify').hidden = true;
+  $('compose').hidden = false;
+  $('who-name').textContent = 'Checking your link…';
+  $('who-id').textContent = '';
+  $('who-change').hidden = true;          // there is no ID to re-enter
+  $('submit').disabled = true;
+
+  try {
+    const found = await api.lookupToken(token, $('session-date').value || todayKey());
+    if (!found.found || !found.active) {
+      showTokenProblem(found.found
+        ? 'That account is archived. See a coach.'
+        : 'That link is not valid any more. You can still find yourself below.');
+      return;
+    }
+    state.token = token;
+    state.student = found;
+    $('who-name').textContent = found.name;
+    $('who-id').textContent = 'Signed in from your emailed link';
+    $('submit').disabled = false;
+    renderSessionNote(found);
+    $('text').focus();
+  } catch (err) {
+    // A dead link must not be a dead end: fall back to the normal ID path
+    // rather than stranding a student on a page that only shows an error.
+    showTokenProblem(err.message);
+  }
+}
+
+function showTokenProblem(message) {
+  state.token = null;
+  $('compose').hidden = true;
+  $('identify').hidden = false;
+  $('who-change').hidden = false;
+  $('submit').disabled = false;
+  setLookupMessage(message, 'error');
+}
+
+const params = new URLSearchParams(location.search);
+const tokenFromUrl = (params.get('t') || '').trim();
+const fromUrl = params.get('id');
+
+if (/^[A-Za-z0-9_-]{16,128}$/.test(tokenFromUrl)) {
+  identifyByToken(tokenFromUrl);
+} else if (fromUrl && isValidStudentId(fromUrl.trim())) {
   $('student-id').value = fromUrl.trim();
   identify(fromUrl.trim());
 }

@@ -133,6 +133,7 @@
   .sheet__row { display: flex; gap: 2vmin; }
   .sheet__row > * { flex: 1; }
   .sheet__msg { margin: 0; font-size: var(--step-md); color: var(--text-dim); min-height: 1.4em; }
+  .sheet__hint { margin: -2vmin 0 0; font-size: var(--step-sm); color: var(--text-dim); }
   .sheet__msg[data-tone="error"] { color: var(--error-bright); }
 
   [hidden] { display: none !important; }
@@ -165,16 +166,27 @@
     <div class="overlay__timer" id="ov-timer"></div>
   </div>
 
-  <!-- Enrollment for an unrecognised card -->
+  <!-- Enrollment for an unrecognised card.
+
+       The email is optional and has to LOOK optional: a student at a wall
+       tablet with a queue behind them needs one obvious way past it, so Skip
+       is a button of its own rather than a blank field they have to trust. -->
   <div class="sheet" id="enroll-sheet" hidden>
     <h1>This card isn't on the roster yet</h1>
     <p class="sheet__id" id="enroll-id">-------</p>
     <label class="visually-hidden" for="enroll-name">Full name</label>
     <input class="field" id="enroll-name" type="text" placeholder="Type your full name"
-           autocomplete="off" autocapitalize="words" spellcheck="false" enterkeyhint="done">
+           autocomplete="off" autocapitalize="words" spellcheck="false" enterkeyhint="next">
+    <label class="visually-hidden" for="enroll-email">Email (optional)</label>
+    <input class="field" id="enroll-email" type="email" placeholder="Email (optional)"
+           autocomplete="off" autocapitalize="off" spellcheck="false"
+           inputmode="email" enterkeyhint="done">
+    <p class="sheet__hint">We email you a link to write up your hours when you scan out.
+      You can skip this and add it later.</p>
     <p class="sheet__msg" id="enroll-msg"></p>
     <div class="sheet__row">
       <button class="btn btn--ghost btn--big" id="enroll-cancel" type="button">Cancel</button>
+      <button class="btn btn--ghost btn--big" id="enroll-skip" type="button">Skip email</button>
       <button class="btn btn--primary btn--big" id="enroll-save" type="button">Save &amp; check in</button>
     </div>
   </div>
@@ -514,13 +526,23 @@ function openEnrollment(studentId) {
   enrollingId = studentId;
   $('enroll-id').textContent = studentId;
   $('enroll-name').value = '';
+  $('enroll-email').value = '';
   $('enroll-msg').textContent = '';
   $('enroll-msg').removeAttribute('data-tone');
   $('enroll-sheet').hidden = false;
   setTimeout(() => $('enroll-name').focus(), 50);
 }
 
-async function saveEnrollment() {
+/**
+ * Same shape the backend checks. Loose on purpose: the only thing worth
+ * catching here is "sam@gmail" or a name typed into the wrong box. A stricter
+ * pattern would bounce a valid address and leave a student stuck at a kiosk
+ * with no keyboard help.
+ */
+const looksLikeEmail = (v) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v);
+
+/** @param {boolean} skipEmail  true when the student tapped Skip email. */
+async function saveEnrollment(skipEmail = false) {
   const name = $('enroll-name').value.trim();
   const msg = $('enroll-msg');
   if (name.length < 2) {
@@ -529,11 +551,22 @@ async function saveEnrollment() {
     return;
   }
 
+  // Skip means skip: whatever is half-typed in the field is discarded rather
+  // than validated, so the button always works in one tap.
+  const email = skipEmail ? '' : $('enroll-email').value.trim();
+  if (email && !looksLikeEmail(email)) {
+    msg.dataset.tone = 'error';
+    msg.textContent = 'That email does not look right. Fix it, or tap Skip email.';
+    $('enroll-email').focus();
+    return;
+  }
+
   $('enroll-save').disabled = true;
+  $('enroll-skip').disabled = true;
   msg.removeAttribute('data-tone');
   msg.textContent = 'Saving…';
   try {
-    await api.enroll(enrollingId, name);
+    await api.enroll(enrollingId, name, '', email);
     students.remember(enrollingId, { name });
     $('enroll-sheet').hidden = true;
     // Enrolling is not the same as arriving, so check them straight in.
@@ -552,12 +585,17 @@ async function saveEnrollment() {
     $('enroll-sheet').hidden = false;
   } finally {
     $('enroll-save').disabled = false;
+    $('enroll-skip').disabled = false;
   }
 }
 
-$('enroll-save').addEventListener('click', saveEnrollment);
+$('enroll-save').addEventListener('click', () => saveEnrollment(false));
+$('enroll-skip').addEventListener('click', () => saveEnrollment(true));
 $('enroll-cancel').addEventListener('click', () => { enrollingId = null; resumeScanning(); });
-$('enroll-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveEnrollment(); });
+$('enroll-name').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('enroll-email').focus();
+});
+$('enroll-email').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveEnrollment(false); });
 
 // ---------------------------------------------------------------------------
 // Screen wake lock — a wall tablet that sleeps is a tablet nobody can scan on
