@@ -258,7 +258,17 @@ Two, both installed by hand from the editor. Re-running an installer is idempote
 | Function | Installer | Schedule |
 | --- | --- | --- |
 | `nightlyMaintenance` | `installNightlyTrigger()` | daily, the hour after `lab_close` |
-| `flushSummaryEmails` | `installSummaryEmailTrigger()` | every 5 minutes |
+| `flushSummaryEmails` | `installSummaryEmailTrigger(minutes)` | every 5 minutes; pass 1, 10, 15 or 30 to change it |
+
+Apps Script fires time triggers on a **best-effort** schedule. The interval is a floor, not
+a promise — a 5-minute trigger can slip to 20 or 30 under load. Do not promise students a
+delivery time. `flushSummaryEmails` logs how long each email actually waited and warns past
+15 minutes, so this is measurable rather than guessed at.
+
+`flushSummaryEmails` peeks at the queue **before** taking the script lock. It runs every
+few minutes forever and the queue is nearly always empty, so grabbing a lock the scanner
+also wants — and blocking on it while a student is mid-scan — would be pure contention for
+a run with nothing to do.
 
 There must be **no** trigger pointing straight at `autoCloseOpenSessions` or
 `rejectUnloggedSessions` — that runs the closer outside the ordering the rejecter depends

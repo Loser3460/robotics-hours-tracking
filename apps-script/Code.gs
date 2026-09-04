@@ -2559,7 +2559,14 @@ function installAutoCloseTrigger() {
  * midnight would email students about a deadline most of the way through their
  * grace period. Idempotent.
  */
-function installSummaryEmailTrigger() {
+function installSummaryEmailTrigger(everyMinutes) {
+  // Apps Script only accepts these, and fires them on a best-effort schedule:
+  // the interval is a floor, not a promise, and a run can slip well past it.
+  var allowed = [1, 5, 10, 15, 30];
+  var minutes = Number(everyMinutes) || 5;
+  if (allowed.indexOf(minutes) < 0) {
+    throw new Error('everyMinutes must be one of ' + allowed.join(', '));
+  }
   var existing = ScriptApp.getProjectTriggers();
   var removed = 0;
   for (var i = 0; i < existing.length; i++) {
@@ -2568,9 +2575,10 @@ function installSummaryEmailTrigger() {
       removed++;
     }
   }
-  ScriptApp.newTrigger('flushSummaryEmails').timeBased().everyMinutes(5).create();
-  Logger.log('Summary email trigger installed, every 5 minutes (removed ' + removed + ' previous)');
-  return { removed: removed, every_minutes: 5 };
+  ScriptApp.newTrigger('flushSummaryEmails').timeBased().everyMinutes(minutes).create();
+  Logger.log('Summary email trigger installed, every ' + minutes + ' minute(s) (removed ' +
+             removed + ' previous)');
+  return { removed: removed, every_minutes: minutes };
 }
 
 // ---------------------------------------------------------------------------
@@ -2824,6 +2832,15 @@ function readMailQueue_(props) {
  */
 function flushSummaryEmails() {
   var props = PropertiesService.getScriptProperties();
+
+  // Peek BEFORE touching the lock. This runs every few minutes forever and the
+  // queue is empty almost every time, so taking a lock the scanner also wants
+  // — and blocking on it for ten seconds if a student is mid-scan — is pure
+  // contention for a run that has nothing to do. A stale read here is
+  // harmless: the worst case is skipping a flush that the next run picks up,
+  // and the authoritative read happens under the lock below.
+  if (!readMailQueue_(props).length) return { sent: 0, skipped: 0, remaining: 0 };
+
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(10000)) {
     Logger.log('flushSummaryEmails: sheet is busy, leaving the queue for the next run');
@@ -2856,7 +2873,7 @@ function flushSummaryEmails() {
   }
 
   var cutoff = Date.now() - MAIL_MAX_AGE_MS;
-  var sent = 0, skipped = 0;
+  var sent = 0, skipped = 0, worstWaitSec = 0;
   var leftover = [];
 
   for (var i = 0; i < batch.length; i++) {
@@ -2875,6 +2892,11 @@ function flushSummaryEmails() {
       MailApp.sendEmail(summaryEmail_(item, base));
       quota--;
       sent++;
+      if (queuedMs) {
+        var waitedSec = Math.round((Date.now() - queuedMs) / 1000);
+        if (waitedSec > worstWaitSec) worstWaitSec = waitedSec;
+        Logger.log('  sent to ' + item.to + ' — waited ' + waitedSec + 's since the scan-out');
+      }
     } catch (err) {
       console.error('could not send the summary email to ' + item.to + ': ' + err);
       skipped++;
@@ -2888,8 +2910,15 @@ function flushSummaryEmails() {
   }
 
   Logger.log('flushSummaryEmails: sent ' + sent + ', skipped ' + skipped +
-             ', held ' + leftover.length + ', quota left ' + Math.max(0, quota));
-  return { sent: sent, skipped: skipped, remaining: leftover.length, quota_left: Math.max(0, quota) };
+             ', held ' + leftover.length + ', quota left ' + Math.max(0, quota) +
+             (worstWaitSec ? ', longest wait ' + worstWaitSec + 's' : ''));
+  if (worstWaitSec > 15 * 60) {
+    console.warn('A summary email waited ' + Math.round(worstWaitSec / 60) + ' minutes to go out. ' +
+                 'Apps Script fires time triggers on a best-effort schedule, so the interval is a ' +
+                 'floor, not a promise. Check Executions for gaps or failures in flushSummaryEmails.');
+  }
+  return { sent: sent, skipped: skipped, remaining: leftover.length,
+           quota_left: Math.max(0, quota), longest_wait_seconds: worstWaitSec };
 }
 
 /** Return claimed items to the queue, merged with anything queued meanwhile. */
