@@ -195,6 +195,7 @@ or insert columns in the middle.
 | `timezone` | Overrides the script timezone so date math has one source. |
 | `drive_folder_id` | |
 | `grace_period_hours` | Default `24`. How long after scanning out a student has to submit a summary. Read by `rejectUnloggedSessions()` and quoted in the email, so the two always agree. Values ≤ 0 fall back to the default. |
+| `summary_email_immediate` | Default `true`. Set `false` to drop the one-shot trigger and let the recurring flusher do all delivery. |
 | `summary_base_url` | Public URL of `summary.html`. **Ships empty** — until it is set, no scan-out emails are sent and `flushSummaryEmails` says so in the log. |
 
 ## Sessions that were never scanned
@@ -261,9 +262,21 @@ Two, both installed by hand from the editor. Re-running an installer is idempote
 | `flushSummaryEmails` | `installSummaryEmailTrigger(minutes)` | every 5 minutes; pass 1, 10, 15 or 30 to change it |
 
 Apps Script fires time triggers on a **best-effort** schedule. The interval is a floor, not
-a promise — a 5-minute trigger can slip to 20 or 30 under load. Do not promise students a
-delivery time. `flushSummaryEmails` logs how long each email actually waited and warns past
-15 minutes, so this is measurable rather than guessed at.
+a promise — a 5-minute trigger has been observed slipping to 26. `flushSummaryEmails` logs
+how long each email actually waited and warns past 15 minutes, so this is measurable rather
+than guessed at.
+
+That is why the recurring trigger is a **safety net, not the delivery mechanism**. A
+scan-out schedules a one-shot `.after(30s)` trigger (`kickSummaryFlush_`), which is the
+only way to get a bounded delay out of Apps Script. It is strictly an optimisation:
+
+- Scans inside the same 90 seconds share one trigger, so a team leaving together creates
+  one, not twenty.
+- The flusher deletes the spent trigger when it runs, so they cannot pile up against the
+  20-per-user cap. It refuses to create one past 12 project triggers.
+- Every failure path — quota, an exception, `summary_email_immediate: false` — falls back
+  to the recurring flusher. It must never be something the mail depends on, and it must
+  never be able to fail a scan.
 
 `flushSummaryEmails` peeks at the queue **before** taking the script lock. It runs every
 few minutes forever and the queue is nearly always empty, so grabbing a lock the scanner

@@ -108,6 +108,15 @@ var COL_STUDENT_TOKEN = 7;
 // Outbound summary emails wait here between the scan that created them and the
 // flushSummaryEmails trigger that sends them. See "Summary emails" below.
 var MAIL_QUEUE_KEY   = 'summary_mail_queue';
+// Bookkeeping for the one-shot "send it now" trigger — see kickSummaryFlush_.
+var MAIL_KICK_KEY    = 'summary_mail_kick';
+var MAIL_KICK_DELAY_MS = 30 * 1000;
+// If a kick is already due within this window, ride on it instead of making
+// another. One trigger serves everyone who scans out in the same minute.
+var MAIL_KICK_WINDOW_MS = 90 * 1000;
+// Apps Script allows 20 triggers per user per script. Stay well clear: if the
+// project is already crowded the recurring flusher still picks the mail up.
+var MAIL_KICK_TRIGGER_CAP = 12;
 var MAIL_QUEUE_MAX   = 400;
 var MAIL_MAX_AGE_MS  = 24 * 3600 * 1000;
 var MAIL_QUOTA_WARN  = 15;
@@ -2431,6 +2440,9 @@ function initializeSheets() {
       // that session stops counting. Read by rejectUnloggedSessions() and
       // quoted in the scan-out email, so both always agree.
       grace_period_hours: '24',
+      // "false" turns off the one-shot trigger that sends scan-out mail within
+      // about 30 seconds, leaving delivery to the recurring flusher alone.
+      summary_email_immediate: 'true',
       // The public URL of summary.html. Left empty on purpose: only you know
       // where this repo is published, and a wrong link in a student's inbox is
       // worse than no email. Until it is set, scan-out emails are not sent and
@@ -2807,6 +2819,75 @@ function queueSummaryEmail_(item) {
     props.setProperty(MAIL_QUEUE_KEY, JSON.stringify(queue));
   } catch (err) {
     console.warn('could not queue the summary email: ' + err);
+    return;
+  }
+  kickSummaryFlush_();
+}
+
+/**
+ * Ask for the queue to be flushed in about 30 seconds.
+ *
+ * The recurring trigger is a safety net, not a delivery mechanism. Apps Script
+ * fires time triggers on a best-effort schedule, so "every 5 minutes" really
+ * means "usually within 5, sometimes 30" — which is fine for a 24-hour deadline
+ * and useless for anyone trying to confirm the feature works.
+ *
+ * A one-shot trigger created at queue time is the only way to get a bounded
+ * delay out of Apps Script. Three things keep it from becoming a problem:
+ *
+ *   - Scans that land in the same 90 seconds share one trigger, so twenty
+ *     students leaving together create one, not twenty.
+ *   - flushSummaryEmails deletes the spent trigger when it runs, so they do not
+ *     accumulate against the 20-per-user cap.
+ *   - If the project is already crowded, or anything here fails at all, it
+ *     gives up silently and the recurring flusher delivers as before. This is
+ *     an optimisation, never a dependency.
+ *
+ * Costs the scan a trigger creation — a couple of hundred milliseconds, once
+ * per 90 seconds across the whole team, and only on a scan-OUT by a student
+ * with an email. Set Config summary_email_immediate to "false" to switch it off
+ * and rely on the recurring trigger alone.
+ */
+function kickSummaryFlush_() {
+  try {
+    if (/^(false|no|0|off)$/i.test(cfgStr_('summary_email_immediate', 'true'))) return;
+
+    var props = PropertiesService.getScriptProperties();
+    var pending = props.getProperty(MAIL_KICK_KEY);
+    if (pending) {
+      var info = JSON.parse(pending);
+      if (Date.now() - Number(info.at || 0) < MAIL_KICK_WINDOW_MS) return;   // one is already coming
+    }
+
+    if (ScriptApp.getProjectTriggers().length >= MAIL_KICK_TRIGGER_CAP) {
+      console.warn('too many triggers to add a one-shot mail flush; the recurring one will send');
+      return;
+    }
+
+    var trigger = ScriptApp.newTrigger('flushSummaryEmails')
+                    .timeBased().after(MAIL_KICK_DELAY_MS).create();
+    props.setProperty(MAIL_KICK_KEY, JSON.stringify({ id: trigger.getUniqueId(), at: Date.now() }));
+  } catch (err) {
+    // Never a reason to fail a scan, and never a reason to lose the mail: the
+    // recurring trigger is still there.
+    console.warn('could not schedule an immediate mail flush: ' + err);
+  }
+}
+
+/** Delete the spent one-shot trigger. Called by the flusher it scheduled. */
+function clearSummaryKick_(props) {
+  try {
+    var raw = props.getProperty(MAIL_KICK_KEY);
+    if (!raw) return;
+    var id = JSON.parse(raw).id;
+    props.deleteProperty(MAIL_KICK_KEY);
+    if (!id) return;
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      if (triggers[i].getUniqueId() === id) ScriptApp.deleteTrigger(triggers[i]);
+    }
+  } catch (err) {
+    console.warn('could not clear the spent one-shot mail trigger: ' + err);
   }
 }
 
@@ -2832,6 +2913,9 @@ function readMailQueue_(props) {
  */
 function flushSummaryEmails() {
   var props = PropertiesService.getScriptProperties();
+  // Whether or not there is mail, a one-shot trigger that has now fired is
+  // spent and must not sit there counting against the 20-per-user cap.
+  clearSummaryKick_(props);
 
   // Peek BEFORE touching the lock. This runs every few minutes forever and the
   // queue is empty almost every time, so taking a lock the scanner also wants
@@ -3037,6 +3121,14 @@ function diagnoseSummaryEmail(studentId) {
   var quota = mailQuota_();
   Logger.log('4. MailApp recipients left today: ' + quota);
   if (quota <= 0) problems.push('MailApp daily quota is exhausted — queued mail is held until tomorrow');
+
+  // 4b. How mail actually gets out.
+  var immediate = !/^(false|no|0|off)$/i.test(cfgStr_('summary_email_immediate', 'true'));
+  Logger.log('4b. Immediate one-shot flush on scan-out: ' + (immediate ? 'on (~30s)' : 'OFF'));
+  if (!immediate) {
+    notes.push('summary_email_immediate is off, so mail waits for the recurring trigger, ' +
+               'which Apps Script fires on a best-effort schedule');
+  }
 
   // 5. What is waiting to go out.
   var queue = readMailQueue_(PropertiesService.getScriptProperties());
