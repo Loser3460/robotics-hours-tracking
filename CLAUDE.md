@@ -265,6 +265,27 @@ There must be **no** trigger pointing straight at `autoCloseOpenSessions` or
 on. `installNightlyTrigger()` deletes any it finds. `installAutoCloseTrigger()` is kept as
 an alias for the same thing so an old bookmark cannot reinstall the broken shape.
 
+## Diagnostics
+
+Run these from the editor — they use the saved code, so no redeploy is needed to use one.
+
+- **`diagnoseSummaryEmail(studentId)`** — "I scanned out and no email arrived." Walks the
+  whole chain in the order it breaks: schema migrated, `summary_base_url` set, triggers
+  installed, quota left, what is queued, and whether the student has an email and a token.
+- **`refreshCaches()`** — drops every cached tab.
+- **`sendTestSummaryEmail(studentId)`** — sends the scan-out email without scanning.
+
+### The table cache cannot see a hand edit
+
+Every write that goes through `Code.gs` invalidates the cached tab for itself. Nothing can
+do that when a value is typed **directly into the Sheet**, so a hand-edited email, name or
+grade is invisible to the backend for up to six hours (`CACHE_TTL_SEC`).
+
+Prefer the admin page, which invalidates for you. After editing a tab by hand, run
+`refreshCaches()`. `diagnoseSummaryEmail()` detects this specific case by comparing
+`loadTable_` (the sheet) against `readTable_` (the cache) and naming the students that
+disagree.
+
 ## Secrets and test data
 
 - **Never commit a real student ID.** Use `1234567` as the dummy ID in all test code,

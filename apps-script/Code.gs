@@ -2330,9 +2330,11 @@ function initializeSheets() {
       var name = tabs[i];
       var header = HEADERS[name];
       var sh = ss.getSheetByName(name);
+      var isNew = false;
       if (!sh) {
         sh = ss.insertSheet(name);
         report.created_tabs.push(name);
+        isNew = true;
       }
       // Write headers only if row 1 is blank or does not match. Never touch row 2+.
       var current = sh.getLastColumn()
@@ -2364,7 +2366,11 @@ function initializeSheets() {
         }
         sh.getRange(1, 1, 1, header.length).setValues([header]);
         report.repaired_headers.push(name);
-        for (var a = 0; a < added.length; a++) report.columns_added.push(name + '.' + added[a]);
+        // Only on a tab that already existed. On a tab we just created, every
+        // column is "added", which drowns the three that actually matter.
+        if (!isNew) {
+          for (var a = 0; a < added.length; a++) report.columns_added.push(name + '.' + added[a]);
+        }
       }
       sh.getRange(1, 1, 1, header.length).setFontWeight('bold');
       sh.setFrozenRows(1);
@@ -2834,10 +2840,14 @@ function flushSummaryEmails() {
 
   var base = cfgStr_('summary_base_url', '');
   if (!base) {
-    Logger.log('flushSummaryEmails: Config summary_base_url is empty, so there is no link ' +
-               'to send — dropping ' + batch.length + ' queued email(s). Set it to the public ' +
-               'URL of summary.html, e.g. https://<user>.github.io/<repo>/summary.html');
-    return { sent: 0, skipped: batch.length, remaining: 0 };
+    // Hold, do not discard. This is a configuration gap, not a bad address:
+    // the moment summary_base_url is filled in, the next run sends what is
+    // waiting. The age check below still prunes anything that goes stale.
+    putBackMailQueue_(props, batch);
+    console.warn('flushSummaryEmails: Config summary_base_url is empty, so there is no link ' +
+                 'to send. Holding ' + batch.length + ' queued email(s). Set it to the public ' +
+                 'URL of summary.html, e.g. https://<user>.github.io/<repo>/summary.html');
+    return { sent: 0, skipped: 0, remaining: batch.length, held_reason: 'summary_base_url is not set' };
   }
 
   var quota = mailQuota_();
@@ -2872,15 +2882,7 @@ function flushSummaryEmails() {
   }
 
   if (leftover.length) {
-    // Merge with anything queued while we were sending.
-    var lock2 = LockService.getScriptLock();
-    if (lock2.tryLock(10000)) {
-      try {
-        props.setProperty(MAIL_QUEUE_KEY, JSON.stringify(readMailQueue_(props).concat(leftover)));
-      } finally {
-        lock2.releaseLock();
-      }
-    }
+    putBackMailQueue_(props, leftover);
     console.warn('MailApp daily quota is exhausted — ' + leftover.length +
                  ' summary email(s) held over until tomorrow');
   }
@@ -2888,6 +2890,20 @@ function flushSummaryEmails() {
   Logger.log('flushSummaryEmails: sent ' + sent + ', skipped ' + skipped +
              ', held ' + leftover.length + ', quota left ' + Math.max(0, quota));
   return { sent: sent, skipped: skipped, remaining: leftover.length, quota_left: Math.max(0, quota) };
+}
+
+/** Return claimed items to the queue, merged with anything queued meanwhile. */
+function putBackMailQueue_(props, items) {
+  if (!items.length) return;
+  var lock = LockService.getScriptLock();
+  var locked = lock.tryLock(10000);
+  try {
+    props.setProperty(MAIL_QUEUE_KEY, JSON.stringify(readMailQueue_(props).concat(items)));
+  } catch (err) {
+    console.error('could not put ' + items.length + ' summary email(s) back on the queue: ' + err);
+  } finally {
+    if (locked) lock.releaseLock();
+  }
 }
 
 /** Remaining recipients today, or a pessimistic 0 if the check itself fails. */
@@ -2935,6 +2951,160 @@ function fmtMinutes_(m) {
   if (m < 60) return m + ' minutes';
   var h = Math.floor(m / 60), rest = m % 60;
   return rest ? h + 'h ' + rest + 'm' : h + (h === 1 ? ' hour' : ' hours');
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics — run from the editor when something did not happen
+// ---------------------------------------------------------------------------
+
+/**
+ * "I scanned out and no email arrived." Run this from the editor and read the
+ * log top to bottom; it walks the whole chain in the order it can break and
+ * says which link is the broken one.
+ *
+ * Pass a student id to check one student specifically, or nothing to check the
+ * roster as a whole.
+ *
+ * It reads Students straight off the sheet, NOT through readTable_. The table
+ * cache is invalidated by every write that goes through this file, but nothing
+ * can invalidate it when a value is typed into the Sheet by hand — so an email
+ * added directly in the tab is invisible to a scan for up to six hours, and
+ * comparing the two reads is the only way to see that from here.
+ */
+function diagnoseSummaryEmail(studentId) {
+  var problems = [];
+  var notes = [];
+
+  Logger.log('=== Summary email diagnosis ===');
+
+  // 1. Is the schema even migrated?
+  var headerRow = sheet_(TAB_STUDENTS).getRange(1, 1, 1, HEADERS[TAB_STUDENTS].length).getValues()[0];
+  var headerOk = String(headerRow[COL_STUDENT_EMAIL - 1]).trim().toLowerCase() === 'email' &&
+                 String(headerRow[COL_STUDENT_TOKEN - 1]).trim().toLowerCase() === 'summary_token';
+  Logger.log('1. Students has email/summary_token columns: ' + (headerOk ? 'yes' : 'NO'));
+  if (!headerOk) problems.push('Students is missing the email/summary_token columns — run initializeSheets()');
+
+  // 2. The link to send.
+  var base = cfgStr_('summary_base_url', '');
+  Logger.log('2. Config summary_base_url: ' + (base || '(EMPTY)'));
+  if (!base) problems.push('Config summary_base_url is empty — no email can be sent until it holds the public URL of summary.html');
+
+  // 3. The trigger that actually sends.
+  var triggers = ScriptApp.getProjectTriggers();
+  var handlers = [];
+  for (var t = 0; t < triggers.length; t++) handlers.push(triggers[t].getHandlerFunction());
+  Logger.log('3. Installed triggers: ' + (handlers.join(', ') || '(none)'));
+  if (handlers.indexOf('flushSummaryEmails') < 0) {
+    problems.push('No flushSummaryEmails trigger — nothing sends the queued mail. Run installSummaryEmailTrigger()');
+  }
+  if (handlers.indexOf('nightlyMaintenance') < 0) {
+    notes.push('No nightlyMaintenance trigger either — run installNightlyTrigger()');
+  }
+  if (handlers.indexOf('autoCloseOpenSessions') >= 0) {
+    problems.push('A bare autoCloseOpenSessions trigger is still installed — run installNightlyTrigger() to replace it');
+  }
+
+  // 4. Can this account send at all?
+  var quota = mailQuota_();
+  Logger.log('4. MailApp recipients left today: ' + quota);
+  if (quota <= 0) problems.push('MailApp daily quota is exhausted — queued mail is held until tomorrow');
+
+  // 5. What is waiting to go out.
+  var queue = readMailQueue_(PropertiesService.getScriptProperties());
+  Logger.log('5. Emails waiting in the queue: ' + queue.length);
+  for (var q = 0; q < queue.length; q++) {
+    Logger.log('     ' + queue[q].to + '  queued ' + queue[q].queued_at + '  (' + queue[q].minutes + ' min)');
+  }
+
+  // 6. The roster, read past the cache.
+  var fresh = loadTable_(TAB_STUDENTS);
+  var cached = studentIndex_(readTable_(TAB_STUDENTS));
+  var withEmail = 0, withToken = 0, stale = [];
+  for (var i = 0; i < fresh.length; i++) {
+    var sid = normId_(fresh[i].student_id);
+    if (!sid) continue;
+    if (studentId && sid !== normId_(studentId)) continue;
+    var email = String(fresh[i].email || '').trim();
+    var token = String(fresh[i].summary_token || '').trim();
+    if (email) withEmail++;
+    if (token) withToken++;
+    var seenByScan = cached[sid] ? cached[sid].email : '';
+    if (email !== seenByScan) stale.push(sid + ' (' + String(fresh[i].name || '') + ')');
+    if (studentId) {
+      Logger.log('6. ' + fresh[i].name + ' [' + sid + ']');
+      Logger.log('     email on the sheet:  ' + (email || '(none)'));
+      Logger.log('     email a scan sees:   ' + (seenByScan || '(none)'));
+      Logger.log('     summary_token:       ' + (token ? token.slice(0, 6) + '… (' + token.length + ' chars)' : '(NONE)'));
+      if (!email) problems.push(fresh[i].name + ' has no email on the roster');
+      if (!token) problems.push(fresh[i].name + ' has no summary_token — run initializeSheets() to backfill');
+    }
+  }
+  if (!studentId) {
+    Logger.log('6. Roster: ' + withEmail + ' student(s) with an email, ' + withToken + ' with a token');
+    if (!withToken) problems.push('No student has a summary_token — run initializeSheets() to backfill');
+  }
+
+  // 7. The trap that has no other symptom.
+  if (stale.length) {
+    Logger.log('7. STALE CACHE for: ' + stale.join(', '));
+    problems.push('An email was typed straight into the Sheet, and the cached roster a scan reads ' +
+                  'still has the old value. Nothing invalidates the cache on a hand edit. Run ' +
+                  'refreshCaches() now, or edit the address from the admin page instead, which ' +
+                  'invalidates it for you.');
+  } else {
+    Logger.log('7. Cached roster agrees with the sheet: yes');
+  }
+
+  Logger.log('---');
+  if (problems.length) {
+    for (var p = 0; p < problems.length; p++) Logger.log('PROBLEM: ' + problems[p]);
+  } else {
+    Logger.log('Nothing obviously wrong. If mail is sitting in the queue, run flushSummaryEmails() ' +
+               'to send it now and read what it reports.');
+  }
+  for (var n = 0; n < notes.length; n++) Logger.log('Note: ' + notes[n]);
+
+  return { problems: problems, notes: notes, queued: queue.length, quota: quota,
+           summary_base_url: base, triggers: handlers, stale_students: stale };
+}
+
+/**
+ * Drop every cached tab, so the next read comes off the sheet.
+ *
+ * Every write that goes through this file invalidates for itself. This is for
+ * the case nothing can catch: a value typed straight into the Sheet by hand,
+ * which the cache has no way to notice and will keep serving for up to six
+ * hours. Run it after editing a tab directly.
+ */
+function refreshCaches() {
+  var tabs = [TAB_STUDENTS, TAB_EVENTS, TAB_SUMMARIES, TAB_CONFIG];
+  for (var i = 0; i < tabs.length; i++) invalidateTable_(tabs[i]);
+  CONFIG_CACHE = null;
+  TABLE_MEMO_ = {};
+  Logger.log('Cleared the cached copy of: ' + tabs.join(', '));
+  return { cleared: tabs };
+}
+
+/**
+ * Send yourself the email a scan-out would have sent, without scanning.
+ * Use it to prove the mail path works once diagnoseSummaryEmail() is clean.
+ */
+function sendTestSummaryEmail(studentId) {
+  var student = studentIndex_(loadTable_(TAB_STUDENTS))[normId_(studentId)];
+  if (!student) throw new Error('no student with id ' + studentId);
+  if (!student.email) throw new Error(student.name + ' has no email on the roster');
+  if (!student.summary_token) throw new Error(student.name + ' has no summary_token — run initializeSheets()');
+  var base = cfgStr_('summary_base_url', '');
+  if (!base) throw new Error('Config summary_base_url is empty');
+
+  var now = new Date();
+  MailApp.sendEmail(summaryEmail_({
+    to: student.email, name: student.name, token: student.summary_token,
+    date: dateKey_(now), minutes: 60, in_time: toIso_(new Date(now.getTime() - 3600000)),
+    out_time: toIso_(now)
+  }, base));
+  Logger.log('Sent a test summary email to ' + student.email);
+  return { sent_to: student.email };
 }
 
 // ---------------------------------------------------------------------------
