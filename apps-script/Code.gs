@@ -3086,25 +3086,61 @@ function refreshCaches() {
 }
 
 /**
- * Send yourself the email a scan-out would have sent, without scanning.
- * Use it to prove the mail path works once diagnoseSummaryEmail() is clean.
+ * Send the email a scan-out would have sent, without scanning. Use it to prove
+ * the mail path works once diagnoseSummaryEmail() is clean.
+ *
+ * Two ways to call it, because the editor's Run button cannot pass an argument:
+ *
+ *   sendTestSummaryEmail()          — press Run. Sends to YOU, the account
+ *                                     running the script, using the first
+ *                                     student who has a token so the link in
+ *                                     it is real and clickable.
+ *   sendTestSummaryEmail('1234567') — sends to that student's own address,
+ *                                     exactly as a real scan-out would.
+ *
+ * No-arg deliberately mails the operator rather than a student: pressing Run on
+ * a function whose name starts with "send" must not put mail in a kid's inbox.
  */
 function sendTestSummaryEmail(studentId) {
-  var student = studentIndex_(loadTable_(TAB_STUDENTS))[normId_(studentId)];
-  if (!student) throw new Error('no student with id ' + studentId);
-  if (!student.email) throw new Error(student.name + ' has no email on the roster');
-  if (!student.summary_token) throw new Error(student.name + ' has no summary_token — run initializeSheets()');
   var base = cfgStr_('summary_base_url', '');
-  if (!base) throw new Error('Config summary_base_url is empty');
+  if (!base) {
+    throw new Error('Config summary_base_url is empty — set it in the Config tab, ' +
+                    'then run refreshCaches() so this reads the new value');
+  }
+  var students = studentIndex_(loadTable_(TAB_STUDENTS));
+  var student = null;
+  var recipient;
+
+  if (studentId === undefined || studentId === null || String(studentId).trim() === '') {
+    for (var sid in students) {
+      if (!students.hasOwnProperty(sid)) continue;
+      if (students[sid].summary_token) { student = students[sid]; break; }
+    }
+    if (!student) throw new Error('no student has a summary_token yet — run initializeSheets() to backfill');
+    recipient = Session.getEffectiveUser().getEmail();
+    if (!recipient) throw new Error('could not work out your own address — call this with a student id instead');
+    Logger.log('No student id given (the Run button cannot pass one), so this is going to YOU at ' +
+               recipient + ', using ' + student.name + "'s link.");
+  } else {
+    student = students[normId_(studentId)];
+    if (!student) {
+      throw new Error('no student with id "' + studentId + '" — pass a 7-digit id as a string, ' +
+                      'e.g. sendTestSummaryEmail(\'1234567\'), or call it with no argument to ' +
+                      'send to yourself');
+    }
+    if (!student.email) throw new Error(student.name + ' has no email on the roster');
+    if (!student.summary_token) throw new Error(student.name + ' has no summary_token — run initializeSheets()');
+    recipient = student.email;
+  }
 
   var now = new Date();
   MailApp.sendEmail(summaryEmail_({
-    to: student.email, name: student.name, token: student.summary_token,
+    to: recipient, name: student.name, token: student.summary_token,
     date: dateKey_(now), minutes: 60, in_time: toIso_(new Date(now.getTime() - 3600000)),
     out_time: toIso_(now)
   }, base));
-  Logger.log('Sent a test summary email to ' + student.email);
-  return { sent_to: student.email };
+  Logger.log('Sent a test summary email to ' + recipient);
+  return { sent_to: recipient, student: student.name };
 }
 
 // ---------------------------------------------------------------------------

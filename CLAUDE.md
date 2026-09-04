@@ -273,7 +273,12 @@ Run these from the editor — they use the saved code, so no redeploy is needed 
   whole chain in the order it breaks: schema migrated, `summary_base_url` set, triggers
   installed, quota left, what is queued, and whether the student has an email and a token.
 - **`refreshCaches()`** — drops every cached tab.
-- **`sendTestSummaryEmail(studentId)`** — sends the scan-out email without scanning.
+- **`sendTestSummaryEmail(studentId)`** — sends the scan-out email without scanning. With
+  no argument it mails **you**, the account running the script, using the first student's
+  link; pressing Run on a function called "send…" must not put mail in a kid's inbox.
+
+The editor's Run button cannot pass an argument, so anything meant to be run from it has
+to work with none. Keep it that way for functions added here.
 
 ### The table cache cannot see a hand edit
 
