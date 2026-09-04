@@ -171,17 +171,18 @@
 
   <!-- Enrollment for an unrecognised card.
 
-       The email is optional and has to LOOK optional: a student at a wall
-       tablet with a queue behind them needs one obvious way past it, so Skip
-       is a button of its own rather than a blank field they have to trust. -->
+       The email is optional and has to LOOK optional — but the field does not
+       say so, because a student at a wall tablet with a queue behind them reads
+       the buttons, not the parentheses. "Skip email" is a button of its own and
+       the hint says it in a sentence; that is the way past, not a label. -->
   <div class="sheet" id="enroll-sheet" hidden>
     <h1>This card isn't on the roster yet</h1>
     <p class="sheet__id" id="enroll-id">-------</p>
     <label class="visually-hidden" for="enroll-name">Full name</label>
     <input class="field" id="enroll-name" type="text" placeholder="Type your full name"
            autocomplete="off" autocapitalize="words" spellcheck="false" enterkeyhint="next">
-    <label class="visually-hidden" for="enroll-email">Email (optional)</label>
-    <input class="field" id="enroll-email" type="email" placeholder="Email (optional)"
+    <label class="visually-hidden" for="enroll-email">Email</label>
+    <input class="field" id="enroll-email" type="email" placeholder="Email"
            autocomplete="off" autocapitalize="off" spellcheck="false"
            inputmode="email" enterkeyhint="done">
     <p class="sheet__hint">We email you a link to write up your hours when you scan out.
