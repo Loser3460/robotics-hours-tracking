@@ -305,6 +305,34 @@ export const admin = {
    */
   recoverEvents: (pin, eventIds, options = {}) =>
     request('recoverEvents', { pin, event_ids: eventIds }, options),
+
+  // --- teams ---------------------------------------------------------------
+  // Teams are a coach-side grouping and nothing else in the app knows they
+  // exist. No event, hour or statistic moves when a student changes team, so
+  // none of these endpoints touches the event log.
+  //
+  // getRoster already returns the team list alongside the students, because no
+  // view can draw a row without both. These are the writes, plus a standalone
+  // read for member counts.
+
+  /** Resolves to {teams: [{team_id, name, created_at, member_count}], unassigned_count}. */
+  getTeams: (pin, options = {}) => request('getTeams', { pin }, options),
+  /** Resolves to {team, teams}. Duplicate names are rejected server-side. */
+  createTeam: (pin, name, options = {}) => request('createTeam', { pin, name }, options),
+  /** One cell. Members carry the id, not the name, so nobody moves. Resolves to {team, teams}. */
+  renameTeam: (pin, teamId, name, options = {}) =>
+    request('renameTeam', { pin, team_id: teamId, name }, options),
+  /** Members fall back to Unassigned in the same lock. Resolves to {teams, unassigned}. */
+  deleteTeam: (pin, teamId, options = {}) => request('deleteTeam', { pin, team_id: teamId }, options),
+  /**
+   * Put students on a team. `students` is one id or an array of them, so
+   * assigning a whole subteam is one request and one column write. Pass an
+   * empty teamId to move them back to Unassigned — a normal answer, not an
+   * error. Resolves to {team_id, changed, students}.
+   */
+  setTeam: (pin, students, teamId, options = {}) =>
+    request('setTeam', { pin, student_ids: Array.isArray(students) ? students : [students],
+                         team_id: teamId || '' }, options),
 };
 
 // --- health -----------------------------------------------------------------

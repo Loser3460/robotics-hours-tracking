@@ -307,6 +307,59 @@
   .row-gap { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
   .add-form { display: flex; gap: 0.75rem; align-items: flex-end; flex-wrap: wrap; padding: 1rem; margin-bottom: 1rem; }
   .email-cell { max-width: 15rem; }
+
+  /* Teams ---------------------------------------------------------------- */
+  .pill--team { background: rgba(88, 166, 255, 0.16); color: var(--out-bright); }
+  .team-cell { white-space: nowrap; }
+
+  /* The hours bar in the team table: a ranking read across rows, so it is
+     scaled to the largest team rather than to a round axis. The number sits on
+     top of it, because the bar answers "who is doing the most" and the figure
+     answers "how much". */
+  .teambar {
+    position: relative;
+    display: flex; align-items: center;
+    min-width: 9rem; height: 1.75rem;
+    padding: 0 0.5rem;
+    border-radius: 0.35rem;
+    background: rgba(255, 255, 255, 0.04);
+    overflow: hidden;
+  }
+  .teambar__fill {
+    position: absolute; inset: 0 auto 0 0;
+    background: var(--out); opacity: 0.55;
+  }
+  .teambar__value {
+    position: relative;
+    font-weight: 700; font-variant-numeric: tabular-nums;
+  }
+
+  /* The member strip under each team row. It is a continuation of the row
+     above, so it loses the top border that would read as a new row. */
+  .team-row--members td {
+    border-top: 0;
+    padding-top: 0;
+    display: flex; flex-wrap: wrap; gap: 0.15rem 0.75rem;
+  }
+  .team-row--unassigned { opacity: 0.78; }
+
+  .picker {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+    gap: 0.25rem;
+    max-height: 20rem; overflow-y: auto;
+    padding: 0.5rem;
+    border: 1px solid var(--border); border-radius: 0.5rem;
+  }
+  .picker__item {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    border-radius: 0.35rem;
+    cursor: pointer;
+  }
+  .picker__item:hover { background: rgba(255, 255, 255, 0.04); }
+  .picker__item--on { background: rgba(88, 166, 255, 0.12); }
+  .picker__team { margin-left: auto; font-size: 0.8125rem; }
   .email-cell__value {
     display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     font-size: 0.875rem;
@@ -361,6 +414,7 @@
     <h1 class="topbar__title">Lab Hours</h1>
     <div class="tabs" role="tablist">
       <button class="tab" id="tab-roster" role="tab" aria-selected="true">Roster</button>
+      <button class="tab" id="tab-teams" role="tab" aria-selected="false">Teams</button>
       <button class="tab" id="tab-timesheet" role="tab" aria-selected="false">Timesheet</button>
       <button class="tab" id="tab-flagged" role="tab" aria-selected="false">Needs review<span class="tab__count" id="flag-count" hidden></span></button>
       <button class="tab" id="tab-rejected" role="tab" aria-selected="false">Rejected hours<span class="tab__count" id="rejected-count" hidden></span></button>
@@ -416,16 +470,26 @@ const state = {
   rejected: [],
   gracePeriodHours: 24,
   byStudent: new Map(),
+  studentById: new Map(),
   summariesByStudent: new Map(),
+  // Teams are roster data, not attendance data: a student's hours do not move
+  // when their team does, so nothing here is derived from the event log. The
+  // list rides along on getRoster; teamsSupported goes false against a backend
+  // deployed before teams existed, and the whole feature hides itself rather
+  // than erroring.
+  teams: [],
+  teamsSupported: true,
   loadedAt: null,
   summariesError: null,
-  view: 'roster',          // 'roster' | 'timesheet' | 'flagged' | 'rejected' | 'detail'
+  view: 'roster',          // 'roster' | 'teams' | 'timesheet' | 'flagged' | 'rejected' | 'detail'
   detailId: null,
   search: '',
   from: '',
   to: '',
   showInactive: false,
+  teamFilter: 'all',       // 'all' | 'unassigned' | a team_id — applies to every list view
   sort: { key: 'name', dir: 1 },
+  teamSort: { key: 'hours', dir: -1 },
   flagFilter: 'all',
   editing: null,           // session key being edited
   confirming: null,        // session key awaiting delete confirmation
@@ -433,6 +497,13 @@ const state = {
   addingSession: false,    // the manual session-entry form is open
   renaming: null,          // student_id whose name is being edited
   editingEmail: null,      // student_id whose email is being edited
+  editingTeam: null,       // student_id whose team picker is open
+  renamingTeam: null,      // team_id whose name is being edited
+  addingTeam: false,       // the new-team form is open
+  confirmingTeam: null,    // team_id awaiting delete confirmation
+  assignTeamId: '',        // the team the bulk assigner will move people to
+  assignSearch: '',        // the assigner's own name filter, kept out of the shared search
+  selectedStudents: new Set(),   // student ids ticked in the bulk assigner
   selectedRejected: new Set(),   // session keys ticked for bulk recovery
   busy: false,
 };
@@ -636,6 +707,7 @@ function flaggedSessions() {
   return state.sessions
     .filter((s) => s.flagged || s.needs_review)
     .filter((s) => flagCategories(s).includes(state.flagFilter) || state.flagFilter === 'all')
+    .filter((s) => matchesTeamId(s.student_id))
     .filter((s) => !term || String(s.name || '').toLowerCase().includes(term) || s.student_id.includes(term))
     .sort((a, b) => String(b.in_time || b.out_time).localeCompare(String(a.in_time || a.out_time)));
 }
@@ -667,6 +739,137 @@ function rangeLabel() {
   if (state.from && state.to) return fmtDate(state.from + 'T12:00') + ' – ' + fmtDate(state.to + 'T12:00');
   if (state.from) return 'Since ' + fmtDate(state.from + 'T12:00');
   return 'Up to ' + fmtDate(state.to + 'T12:00');
+}
+
+
+// ---------------------------------------------------------------------------
+// Teams
+//
+// A team is a label on a student and nothing more. No hour, session, average,
+// chart bucket or review count is derived from it — those all come from the
+// event log, which stores only student_id — so moving somebody between teams
+// the night before competition changes what the totals are GROUPED BY and
+// never what they are.
+//
+// "Unassigned" is deliberately not a team. It is the absence of one, written
+// as an empty team_id, and it is what every student starts as and what they
+// fall back to when a team is deleted. It has no row, cannot be renamed, and
+// cannot be removed — so it is represented here by the empty string and given
+// a name only at the point it is drawn.
+// ---------------------------------------------------------------------------
+
+const UNASSIGNED = '';
+
+function teamById(teamId) {
+  return state.teams.find((t) => t.team_id === teamId) || null;
+}
+
+/**
+ * The team a student is actually on, as a key.
+ *
+ * A team_id pointing at a team that no longer exists reads as Unassigned. The
+ * backend clears the column when it deletes a team, so this should not happen —
+ * but a stale row must not vanish from every view because of a dangling id.
+ */
+function teamKeyOf(student) {
+  const id = student && student.team_id ? String(student.team_id) : UNASSIGNED;
+  return id && teamById(id) ? id : UNASSIGNED;
+}
+
+function teamName(teamId) {
+  const team = teamById(teamId);
+  return team ? team.name : 'Unassigned';
+}
+
+/** Every team key that gets a row in the stats table, Unassigned last. */
+function teamKeys() {
+  return state.teams.map((t) => t.team_id).concat([UNASSIGNED]);
+}
+
+function studentsOfTeam(teamId, { includeInactive = state.showInactive } = {}) {
+  return state.students.filter((s) =>
+    (includeInactive || s.active) && teamKeyOf(s) === teamId);
+}
+
+/** The single team-filter test. Every list view runs its rows through this. */
+function matchesTeam(student) {
+  if (state.teamFilter === 'all') return true;
+  // A session whose student is not on the roster at all has no team, so it
+  // belongs with the unassigned rather than showing up under every filter.
+  const key = student ? teamKeyOf(student) : UNASSIGNED;
+  if (state.teamFilter === 'unassigned') return key === UNASSIGNED;
+  return key === state.teamFilter;
+}
+
+function matchesTeamId(studentId) {
+  return matchesTeam(state.studentById.get(studentId));
+}
+
+/** Roll a team's students up into the same shape statsFor() returns, plus size. */
+function teamStats(teamId) {
+  const members = studentsOfTeam(teamId);
+  const sessions = [];
+  for (const member of members) sessions.push(...inRange(sessionsOf(member.student_id)));
+  const st = statsFor(sessions);
+  const active = members.filter((m) => m.active).length;
+  return {
+    teamId,
+    name: teamName(teamId),
+    members,
+    size: members.length,
+    activeSize: active,
+    inLab: members.filter((m) => m.active && statsFor(sessionsOf(m.student_id)).open).length,
+    ...st,
+    // Hours per student is the number that makes two teams of different sizes
+    // comparable, and it is the reason this table exists rather than a sort on
+    // the timesheet. Divide by everyone on the team, including the people with
+    // no hours — leaving them out would flatter a team that half showed up.
+    perStudent: members.length ? st.totalMinutes / members.length : 0,
+  };
+}
+
+/** The filter control shared by the roster, timesheet and both queues. */
+function teamFilterHtml() {
+  if (!state.teamsSupported) return '';
+  const option = (value, label, count) =>
+    `<option value="${esc(value)}" ${state.teamFilter === value ? 'selected' : ''}>` +
+    `${esc(label)}${count == null ? '' : ` (${count})`}</option>`;
+
+  return `
+    <div class="control">
+      <label class="control__label" for="team-filter">Team</label>
+      <select class="input" id="team-filter" style="min-width:11rem">
+        ${option('all', 'All teams', null)}
+        ${state.teams.map((t) => option(t.team_id, t.name, studentsOfTeam(t.team_id).length)).join('')}
+        ${option('unassigned', 'Unassigned', studentsOfTeam(UNASSIGNED).length)}
+      </select>
+    </div>`;
+}
+
+/** What the current team filter is showing, for a view's summary line. */
+function teamLabel() {
+  if (!state.teamsSupported || state.teamFilter === 'all') return 'All teams';
+  if (state.teamFilter === 'unassigned') return 'Unassigned';
+  return teamName(state.teamFilter);
+}
+
+/**
+ * The timesheet's footer label. It used to read "Team total" back when there
+ * was only one team; with a filter above it that word is now ambiguous, and a
+ * footer that says "Team total" under a table filtered to Programming is
+ * actively misleading about what it adds up.
+ */
+function totalLabel() {
+  if (!state.teamsSupported || state.teamFilter === 'all') return 'Total — all teams';
+  if (state.teamFilter === 'unassigned') return 'Total — unassigned';
+  return 'Total — ' + teamName(state.teamFilter);
+}
+
+/** A small team label for a roster row or the detail heading. */
+function teamPill(student) {
+  const key = teamKeyOf(student);
+  if (key === UNASSIGNED) return '<span class="muted">Unassigned</span>';
+  return `<span class="pill pill--team">${esc(teamName(key))}</span>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +908,12 @@ async function load() {
     });
 
   state.students = roster.students.slice().sort((a, b) => a.name.localeCompare(b.name));
+  state.studentById = new Map(state.students.map((s) => [s.student_id, s]));
+  // An older deployment answers getRoster without a teams key at all. That is
+  // not an error to shout about — it is a feature that is not there yet — so
+  // the Teams tab explains the redeploy and every team control hides itself.
+  state.teamsSupported = Array.isArray(roster.teams);
+  state.teams = (roster.teams || []).slice().sort((a, b) => a.name.localeCompare(b.name));
   // THE split. Everything downstream reads state.sessions and can stay ignorant
   // of rejection; the Rejected hours view is the only reader of state.rejected.
   state.sessions = timesheet.sessions.filter((s) => s.event_status !== 'rejected');
@@ -765,6 +974,7 @@ function render() {
     ? 'Updated ' + state.loadedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
     : '';
   $('tab-roster').setAttribute('aria-selected', String(state.view === 'roster'));
+  $('tab-teams').setAttribute('aria-selected', String(state.view === 'teams'));
   $('tab-timesheet').setAttribute('aria-selected', String(state.view === 'timesheet'));
   $('tab-flagged').setAttribute('aria-selected', String(state.view === 'flagged'));
   $('tab-rejected').setAttribute('aria-selected', String(state.view === 'rejected'));
@@ -781,6 +991,7 @@ function render() {
   }
 
   if (state.view === 'detail') $('view').innerHTML = detailHtml();
+  else if (state.view === 'teams') $('view').innerHTML = teamsHtml();
   else if (state.view === 'timesheet') $('view').innerHTML = timesheetHtml();
   else if (state.view === 'flagged') $('view').innerHTML = flaggedHtml();
   else if (state.view === 'rejected') $('view').innerHTML = rejectedHtml();
@@ -814,6 +1025,7 @@ function rosterHtml() {
   const term = state.search.trim().toLowerCase();
   const rows = state.students.filter((s) => {
     if (!state.showInactive && !s.active) return false;
+    if (!matchesTeam(s)) return false;
     if (!term) return true;
     return s.name.toLowerCase().includes(term) || s.student_id.includes(term);
   });
@@ -827,15 +1039,19 @@ function rosterHtml() {
     // view — a click in the text field would navigate away mid-edit.
     const renaming = state.renaming === student.student_id;
     const editingEmail = state.editingEmail === student.student_id;
+    const editingTeam = state.editingTeam === student.student_id;
     // A row being edited must not also be a link to the detail view — a click
     // in the text field would navigate away mid-edit.
-    const inline = renaming || editingEmail;
+    const inline = renaming || editingEmail || editingTeam;
     return `
       <tr ${inline ? '' : `class="clickable" data-action="open" data-id="${esc(student.student_id)}"`}>
         <td class="name-cell">${renaming ? renameInputHtml(student) : `${esc(student.name)}
           ${student.active ? '' : ' <span class="pill pill--quiet">Archived</span>'}
           ${livePill(st.open)}`}</td>
         <td class="muted">${esc(student.grade || '—')}</td>
+        ${state.teamsSupported
+          ? `<td class="team-cell">${editingTeam ? teamSelectHtml(student) : teamPill(student)}</td>`
+          : ''}
         <td class="email-cell">${editingEmail ? emailInputHtml(student) : emailCellHtml(student)}</td>
         <td class="num">${fmtHours(st.totalMinutes)}</td>
         <td class="num">${st.count}</td>
@@ -844,10 +1060,14 @@ function rosterHtml() {
         <td><div class="row-actions">${
           renaming ? renameButtonsHtml(student)
           : editingEmail ? emailButtonsHtml(student)
+          : editingTeam ? `<button class="btn btn--ghost btn-sm" data-action="team-cancel"
+                  type="button">Cancel</button>`
           : `<button class="btn btn--ghost btn-sm" data-action="rename"
                   data-id="${esc(student.student_id)}">Rename</button>
           <button class="btn btn--ghost btn-sm" data-action="edit-email"
                   data-id="${esc(student.student_id)}">Email</button>
+          ${state.teamsSupported ? `<button class="btn btn--ghost btn-sm" data-action="edit-team"
+                  data-id="${esc(student.student_id)}">Team</button>` : ''}
           <button class="btn btn--ghost btn-sm" data-action="toggle-active"
                   data-id="${esc(student.student_id)}" data-active="${student.active}"
             >${student.active ? 'Archive' : 'Restore'}</button>`}</div></td>
@@ -863,6 +1083,7 @@ function rosterHtml() {
         <input class="input input--search" id="search" type="search" placeholder="Name or ID"
                value="${esc(state.search)}" autocomplete="off">
       </div>
+      ${teamFilterHtml()}
       <div class="control">
         <label class="control__label" for="show-inactive">&nbsp;</label>
         <label class="row-gap" style="min-height:2.75rem">
@@ -884,10 +1105,11 @@ function rosterHtml() {
     <div class="table-scroll">
       <table>
         <thead><tr>
-          <th>Name</th><th>Grade</th><th>Email</th><th class="num">Hours</th><th class="num">Sessions</th>
+          <th>Name</th><th>Grade</th>${state.teamsSupported ? '<th>Team</th>' : ''}
+          <th>Email</th><th class="num">Hours</th><th class="num">Sessions</th>
           <th>Last seen</th><th>Review</th><th></th>
         </tr></thead>
-        <tbody>${body || '<tr><td colspan="8" class="empty">No students match.</td></tr>'}</tbody>
+        <tbody>${body || `<tr><td colspan="${state.teamsSupported ? 9 : 8}" class="empty">No students match.</td></tr>`}</tbody>
       </table>
     </div>`;
 }
@@ -925,6 +1147,26 @@ function emailInputHtml(student) {
            inputmode="email" spellcheck="false" aria-label="Email address"
            placeholder="name@example.com" value="${esc(student.email || '')}">
     <span class="muted" id="email-msg"></span>`;
+}
+
+/**
+ * The team picker, shown in place of the team pill in a roster row.
+ *
+ * It saves on change rather than behind a Save button: there is exactly one
+ * field, no free text to typo and nothing to validate, so a second click would
+ * only be ceremony. The id is stable so render() can restore focus across the
+ * re-renders the live-counter timer causes.
+ */
+function teamSelectHtml(student) {
+  const current = teamKeyOf(student);
+  const option = (value, label) =>
+    `<option value="${esc(value)}" ${current === value ? 'selected' : ''}>${esc(label)}</option>`;
+  return `
+    <select class="input" id="team-select" data-id="${esc(student.student_id)}"
+            aria-label="Team" style="min-width:10rem">
+      ${option(UNASSIGNED, 'Unassigned')}
+      ${state.teams.map((t) => option(t.team_id, t.name)).join('')}
+    </select>`;
 }
 
 function emailButtonsHtml(student) {
@@ -967,6 +1209,250 @@ function addFormHtml() {
     </div>`;
 }
 
+// ---- Teams ----------------------------------------------------------------
+
+function teamSortArrow(key) {
+  if (state.teamSort.key !== key) return '';
+  return state.teamSort.dir === 1 ? ' ↑' : ' ↓';
+}
+
+/** Every team's roll-up, in the order the header says. */
+function teamRows() {
+  const rows = teamKeys().map(teamStats);
+  const { key, dir } = state.teamSort;
+  const value = (r) => ({
+    name: r.name.toLowerCase(),
+    size: r.size,
+    hours: r.totalMinutes,
+    perStudent: r.perStudent,
+    sessions: r.count,
+    average: r.average ?? -1,
+    review: r.problems,
+  }[key]);
+
+  return rows.sort((a, b) => {
+    // Unassigned is a bucket, not a team, and it belongs at the bottom whatever
+    // the sort — a coach comparing subteams is not comparing against it.
+    if (a.teamId === UNASSIGNED) return 1;
+    if (b.teamId === UNASSIGNED) return -1;
+    const av = value(a), bv = value(b);
+    if (av < bv) return -dir;
+    if (av > bv) return dir;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+/**
+ * The hours cell, with the team's share of the largest team's hours drawn
+ * behind the number.
+ *
+ * Anchored at zero and scaled to the biggest bar rather than to a round axis:
+ * this is a ranking read across rows, not a value read off a scale, and the
+ * number itself is right there in the cell for anyone who wants the quantity.
+ */
+function teamBarHtml(minutes, peak) {
+  const pct = peak > 0 ? Math.round((minutes / peak) * 100) : 0;
+  return `
+    <div class="teambar">
+      <div class="teambar__fill" style="width:${pct}%"></div>
+      <span class="teambar__value">${fmtHours(minutes)}</span>
+    </div>`;
+}
+
+function teamsHtml() {
+  if (!state.teamsSupported) {
+    return `<div class="card"><div class="empty">
+      Teams need a newer backend — redeploy the Apps Script Web App
+      (Deploy → Manage deployments → edit → New version), and run
+      <code>initializeSheets()</code> once from the editor to add the Teams tab.
+    </div></div>`;
+  }
+
+  const rows = teamRows();
+  const peak = rows.reduce((max, r) => Math.max(max, r.totalMinutes), 0);
+  const assigned = state.students.filter((s) =>
+    (state.showInactive || s.active) && teamKeyOf(s) !== UNASSIGNED).length;
+  const shown = state.students.filter((s) => state.showInactive || s.active).length;
+  const totalMinutes = rows.reduce((sum, r) => sum + r.totalMinutes, 0);
+  const totalSessions = rows.reduce((sum, r) => sum + r.count, 0);
+
+  const body = rows.map((r) => {
+    const unassigned = r.teamId === UNASSIGNED;
+    const renaming = state.renamingTeam === r.teamId;
+    const confirming = state.confirmingTeam === r.teamId;
+    return `
+    <tr class="${unassigned ? 'team-row--unassigned' : ''}">
+      <td class="name-cell">${renaming
+        ? `<input class="input" id="team-name-input" maxlength="60" autocomplete="off"
+                  aria-label="Team name" value="${esc(r.name)}">`
+        : `${esc(r.name)}${unassigned
+            ? ' <span class="muted" style="font-weight:400">· not a team</span>' : ''}
+           ${r.inLab ? `<span class="pill pill--in"><span class="live-dot"></span> ${r.inLab} in now</span>` : ''}`}</td>
+      <td class="num">${r.size}${r.size !== r.activeSize ? ` <span class="muted">(${r.activeSize} active)</span>` : ''}</td>
+      <td>${teamBarHtml(r.totalMinutes, peak)}</td>
+      <td class="num">${fmtHours(r.perStudent)}</td>
+      <td class="num">${r.count}</td>
+      <td class="num">${r.average == null ? '—' : fmtDur(r.average)}</td>
+      <td class="num">${r.problems ? `<span class="pill pill--review">⚠ ${r.problems}</span>` : '<span class="muted">0</span>'}</td>
+      <td><div class="row-actions">${
+        renaming ? `
+          <button class="btn btn--primary btn-sm" data-action="team-rename-save"
+                  data-id="${esc(r.teamId)}" type="button">Save</button>
+          <button class="btn btn--ghost btn-sm" data-action="team-rename-cancel" type="button">Cancel</button>`
+        : confirming ? `
+          <span class="muted">Members become Unassigned.</span>
+          <button class="btn btn--ghost btn-sm btn-danger" data-action="team-delete-confirm"
+                  data-id="${esc(r.teamId)}" type="button">Delete</button>
+          <button class="btn btn--ghost btn-sm" data-action="team-delete-cancel" type="button">Cancel</button>`
+        : `
+          <button class="btn btn--ghost btn-sm" data-action="team-view"
+                  data-id="${esc(unassigned ? 'unassigned' : r.teamId)}">Timesheet</button>
+          ${unassigned ? '' : `
+            <button class="btn btn--ghost btn-sm" data-action="team-rename"
+                    data-id="${esc(r.teamId)}">Rename</button>
+            <button class="btn btn--ghost btn-sm" data-action="team-delete"
+                    data-id="${esc(r.teamId)}">Delete</button>`}`}</div></td>
+    </tr>
+    <tr class="team-row--members ${unassigned ? 'team-row--unassigned' : ''}">
+      <td colspan="8">${r.members.length
+        ? r.members.map((m) => `<button class="who-link" data-action="open"
+              data-id="${esc(m.student_id)}">${esc(m.name)}${m.active ? '' : ' (archived)'}</button>`).join('')
+        : '<span class="muted">Nobody on this team yet.</span>'}</td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <div class="controls">
+      <div class="control">
+        <label class="control__label" for="from">From</label>
+        <input class="input" id="from" type="date" value="${esc(state.from)}">
+      </div>
+      <div class="control">
+        <label class="control__label" for="to">To</label>
+        <input class="input" id="to" type="date" value="${esc(state.to)}">
+      </div>
+      <div class="control">
+        <span class="control__label">Quick range</span>
+        <div class="presets">
+          <button class="btn btn--ghost btn-sm" data-action="preset" data-preset="all">All time</button>
+          <button class="btn btn--ghost btn-sm" data-action="preset" data-preset="week">This week</button>
+          <button class="btn btn--ghost btn-sm" data-action="preset" data-preset="30">Last 30 days</button>
+          <button class="btn btn--ghost btn-sm" data-action="preset" data-preset="season">This season</button>
+        </div>
+      </div>
+      <div class="control">
+        <label class="control__label" for="show-inactive">&nbsp;</label>
+        <label class="row-gap" style="min-height:2.75rem">
+          <input type="checkbox" id="show-inactive" ${state.showInactive ? 'checked' : ''}>
+          <span>Count archived</span>
+        </label>
+      </div>
+      <span class="topbar__spacer"></span>
+      <button class="btn btn--primary btn-sm" data-action="show-add-team" type="button">New team</button>
+    </div>
+
+    ${state.addingTeam ? `
+      <div class="card add-form">
+        <div class="control" style="flex:1;min-width:14rem">
+          <label class="control__label" for="add-team-name">Team name</label>
+          <input class="input" id="add-team-name" maxlength="60" autocomplete="off"
+                 placeholder="e.g. Build, Programming, Business">
+        </div>
+        <button class="btn btn--primary btn-sm" data-action="add-team-save" type="button">Create team</button>
+        <button class="btn btn--ghost btn-sm" data-action="add-team-cancel" type="button">Cancel</button>
+        <span class="muted" id="add-team-msg"></span>
+      </div>` : ''}
+
+    <div class="tiles">
+      <div class="tile"><div class="tile__label">Teams</div>
+        <div class="tile__value">${state.teams.length}</div></div>
+      <div class="tile"><div class="tile__label">Assigned</div>
+        <div class="tile__value">${assigned}<small> of ${shown}</small></div></div>
+      <div class="tile"><div class="tile__label">Total hours</div>
+        <div class="tile__value">${fmtHours(totalMinutes)} <small>h</small></div></div>
+      <div class="tile"><div class="tile__label">Sessions</div>
+        <div class="tile__value">${totalSessions}</div></div>
+    </div>
+
+    <p class="muted" style="margin:0 0 0.75rem">
+      ${esc(rangeLabel())} · hours are recomputed from the log, so moving a student
+      between teams moves their hours with them and changes no total.
+    </p>
+
+    <div class="table-scroll" style="margin-bottom:1.25rem">
+      <table>
+        <thead><tr>
+          <th class="sortable" data-action="team-sort" data-key="name">Team${teamSortArrow('name')}</th>
+          <th class="sortable num" data-action="team-sort" data-key="size">Students${teamSortArrow('size')}</th>
+          <th class="sortable" data-action="team-sort" data-key="hours">Total hours${teamSortArrow('hours')}</th>
+          <th class="sortable num" data-action="team-sort" data-key="perStudent">Per student${teamSortArrow('perStudent')}</th>
+          <th class="sortable num" data-action="team-sort" data-key="sessions">Sessions${teamSortArrow('sessions')}</th>
+          <th class="sortable num" data-action="team-sort" data-key="average">Avg session${teamSortArrow('average')}</th>
+          <th class="sortable num" data-action="team-sort" data-key="review">Review${teamSortArrow('review')}</th>
+          <th></th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+
+    ${assignPanelHtml()}`;
+}
+
+/**
+ * Bulk assignment: tick names, pick a team, save once.
+ *
+ * The roster's per-row picker is the right tool for moving one student. This is
+ * the one for the start of a season, where the whole roster gets sorted in one
+ * sitting — and it is one request and one column write on the server, not one
+ * per student.
+ */
+function assignPanelHtml() {
+  const term = state.assignSearch.trim().toLowerCase();
+  const candidates = state.students.filter((s) => {
+    if (!state.showInactive && !s.active) return false;
+    if (!term) return true;
+    return s.name.toLowerCase().includes(term) || s.student_id.includes(term);
+  });
+  const picked = state.selectedStudents.size;
+
+  return `
+    <div class="card" style="padding:1rem">
+      <div class="row-gap" style="margin-bottom:0.75rem">
+        <strong>Assign students to a team</strong>
+        <span class="muted">Tick names, choose a team, save once.</span>
+        <span style="flex:1"></span>
+        <input class="input input--search" id="assign-search" type="search"
+               placeholder="Filter names" value="${esc(state.assignSearch)}" autocomplete="off">
+      </div>
+
+      <div class="picker">
+        ${candidates.map((s) => `
+          <label class="picker__item ${state.selectedStudents.has(s.student_id) ? 'picker__item--on' : ''}">
+            <input type="checkbox" data-action="pick-student" data-id="${esc(s.student_id)}"
+                   ${state.selectedStudents.has(s.student_id) ? 'checked' : ''}>
+            <span>${esc(s.name)}</span>
+            <span class="muted picker__team">${esc(teamName(teamKeyOf(s)))}</span>
+          </label>`).join('') || '<span class="muted">No students match.</span>'}
+      </div>
+
+      <div class="row-gap" style="margin-top:0.85rem">
+        <button class="btn btn--ghost btn-sm" data-action="pick-all">${
+          candidates.length && candidates.every((s) => state.selectedStudents.has(s.student_id))
+            ? 'Clear all' : 'Select all shown'}</button>
+        <span class="muted">${picked} selected</span>
+        <span style="flex:1"></span>
+        <label class="control__label" for="assign-team">Move to</label>
+        <select class="input" id="assign-team" style="min-width:11rem">
+          <option value="" ${state.assignTeamId === '' ? 'selected' : ''}>Unassigned</option>
+          ${state.teams.map((t) => `<option value="${esc(t.team_id)}"
+            ${state.assignTeamId === t.team_id ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}
+        </select>
+        <button class="btn btn--primary btn-sm" data-action="assign-save"
+                ${picked ? '' : 'disabled'} type="button">Assign ${picked || ''}</button>
+      </div>
+    </div>`;
+}
+
 // ---- Timesheet ------------------------------------------------------------
 
 function timesheetRows() {
@@ -974,6 +1460,7 @@ function timesheetRows() {
   const rows = [];
   for (const student of state.students) {
     if (!state.showInactive && !student.active) continue;
+    if (!matchesTeam(student)) continue;
     if (term && !student.name.toLowerCase().includes(term) && !student.student_id.includes(term)) continue;
     const st = statsFor(inRange(sessionsOf(student.student_id)));
     rows.push({ student, st });
@@ -983,6 +1470,9 @@ function timesheetRows() {
   const value = (r) => ({
     name: r.student.name.toLowerCase(),
     grade: r.student.grade || '',
+    // Unassigned sorts after every named team rather than first on an empty
+    // string, which is where a coach looks for it.
+    team: teamKeyOf(r.student) === UNASSIGNED ? '\uffff' : teamName(teamKeyOf(r.student)).toLowerCase(),
     hours: r.st.totalMinutes,
     sessions: r.st.count,
     average: r.st.average ?? -1,
@@ -1013,6 +1503,7 @@ function timesheetHtml() {
     <tr class="clickable" data-action="open" data-id="${esc(student.student_id)}">
       <td class="name-cell">${esc(student.name)}${student.active ? '' : ' <span class="pill pill--quiet">Archived</span>'}${livePill(st.open)}</td>
       <td class="muted">${esc(student.grade || '—')}</td>
+      ${state.teamsSupported ? `<td>${teamPill(student)}</td>` : ''}
       <td class="num">${fmtHours(st.totalMinutes)}</td>
       <td class="num">${st.count}</td>
       <td class="num">${st.average == null ? '—' : fmtDur(st.average)}</td>
@@ -1043,6 +1534,7 @@ function timesheetHtml() {
         <label class="control__label" for="search">Search</label>
         <input class="input" id="search" type="search" placeholder="Name or ID" value="${esc(state.search)}" autocomplete="off">
       </div>
+      ${teamFilterHtml()}
       <span class="topbar__spacer"></span>
       <button class="btn btn--ghost btn-sm" data-action="show-add-session" type="button">Add session</button>
       <button class="btn btn--primary btn-sm" data-action="export" type="button">Export CSV</button>
@@ -1050,22 +1542,24 @@ function timesheetHtml() {
 
     ${state.addingSession ? addSessionFormHtml() : ''}
 
-    <p class="muted" style="margin:0 0 0.75rem">${esc(rangeLabel())} · ${rows.length} students</p>
+    <p class="muted" style="margin:0 0 0.75rem">${esc(rangeLabel())} · ${esc(teamLabel())} · ${rows.length} students</p>
 
     <div class="table-scroll">
       <table>
         <thead><tr>
           <th class="sortable" data-action="sort" data-key="name">Name${sortArrow('name')}</th>
           <th class="sortable" data-action="sort" data-key="grade">Grade${sortArrow('grade')}</th>
+          ${state.teamsSupported
+            ? `<th class="sortable" data-action="sort" data-key="team">Team${sortArrow('team')}</th>` : ''}
           <th class="sortable num" data-action="sort" data-key="hours">Total hours${sortArrow('hours')}</th>
           <th class="sortable num" data-action="sort" data-key="sessions">Sessions${sortArrow('sessions')}</th>
           <th class="sortable num" data-action="sort" data-key="average">Avg session${sortArrow('average')}</th>
           <th class="sortable" data-action="sort" data-key="last">Last seen${sortArrow('last')}</th>
           <th class="sortable num" data-action="sort" data-key="review">Review${sortArrow('review')}</th>
         </tr></thead>
-        <tbody>${body || '<tr><td colspan="7" class="empty">No sessions in this range.</td></tr>'}</tbody>
+        <tbody>${body || `<tr><td colspan="${state.teamsSupported ? 8 : 7}" class="empty">No sessions in this range.</td></tr>`}</tbody>
         <tfoot><tr>
-          <td>Team total</td><td></td>
+          <td>${esc(totalLabel())}</td><td></td>${state.teamsSupported ? '<td></td>' : ''}
           <td class="num">${fmtHours(totalMinutes)}</td>
           <td class="num">${totalSessions}</td>
           <td class="num">${totalSessions ? fmtDur(Math.round(totalMinutes / totalSessions)) : '—'}</td>
@@ -1156,6 +1650,7 @@ function flaggedHtml() {
         <input class="input input--search" id="search" type="search" placeholder="Name or ID"
                value="${esc(state.search)}" autocomplete="off">
       </div>
+      ${teamFilterHtml()}
     </div>
 
     ${counts.review ? `<div class="banner" style="border-color:var(--warn);background:rgba(210,153,34,0.12)">
@@ -1164,7 +1659,7 @@ function flaggedHtml() {
       </div>` : ''}
 
     <p class="muted" style="margin:0 0 0.75rem">
-      ${rows.length} session${rows.length === 1 ? '' : 's'} shown · all dates
+      ${rows.length} session${rows.length === 1 ? '' : 's'} shown · ${esc(teamLabel())} · all dates
     </p>
 
     <div class="card">
@@ -1192,6 +1687,7 @@ function rejectedGroups() {
   const term = state.search.trim().toLowerCase();
   const byStudent = new Map();
   for (const session of state.rejected) {
+    if (!matchesTeamId(session.student_id)) continue;
     if (term && !String(session.name || '').toLowerCase().includes(term) &&
         !session.student_id.includes(term)) continue;
     if (!byStudent.has(session.student_id)) byStudent.set(session.student_id, []);
@@ -1274,6 +1770,7 @@ function rejectedHtml() {
         <input class="input input--search" id="search" type="search" placeholder="Name or ID"
                value="${esc(state.search)}" autocomplete="off">
       </div>
+      ${teamFilterHtml()}
     </div>
 
     ${selected ? `
@@ -1287,7 +1784,7 @@ function rejectedHtml() {
 
     <p class="muted" style="margin:0 0 0.75rem">
       ${shown} rejected session${shown === 1 ? '' : 's'} · ${fmtHours(totalMinutes)} h not counting ·
-      all dates · grace period ${state.gracePeriodHours}h
+      ${esc(teamLabel())} · all dates · grace period ${state.gracePeriodHours}h
     </p>
 
     ${body || `<div class="card"><div class="empty">
@@ -1372,6 +1869,7 @@ function detailHtml() {
   const summaryCount = summariesOf(student.student_id).length;
   const renaming = state.renaming === student.student_id;
   const editingEmail = state.editingEmail === student.student_id;
+  const editingTeam = state.editingTeam === student.student_id;
 
   return `
     <button class="back" data-action="back">← All students</button>
@@ -1383,6 +1881,7 @@ function detailHtml() {
           : `<h2>${esc(student.name)} ${livePill(st.open)}</h2>`}
         <p class="muted" style="margin:0.25rem 0 0">
           ID ${esc(student.student_id)}${student.grade ? ' · Grade ' + esc(student.grade) : ''}
+          ${state.teamsSupported ? ' · ' + (editingTeam ? teamSelectHtml(student) : teamPill(student)) : ''}
           ${student.active ? '' : ' · <span class="pill pill--quiet">Archived</span>'}
         </p>
         <p class="muted" style="margin:0.25rem 0 0">${editingEmail
@@ -1395,10 +1894,15 @@ function detailHtml() {
       <div class="row-actions">${
         renaming ? renameButtonsHtml(student)
         : editingEmail ? emailButtonsHtml(student)
+        : editingTeam ? `<button class="btn btn--ghost btn-sm" data-action="team-cancel"
+                type="button">Done</button>`
         : `<button class="btn btn--ghost btn-sm" data-action="rename"
                 data-id="${esc(student.student_id)}">Rename</button>
         <button class="btn btn--ghost btn-sm" data-action="edit-email"
                 data-id="${esc(student.student_id)}">${student.email ? 'Edit email' : 'Add email'}</button>
+        ${state.teamsSupported ? `<button class="btn btn--ghost btn-sm" data-action="edit-team"
+                data-id="${esc(student.student_id)}">${
+                  teamKeyOf(student) === UNASSIGNED ? 'Add to team' : 'Change team'}</button>` : ''}
         <button class="btn btn--ghost btn-sm" data-action="toggle-active"
                 data-id="${esc(student.student_id)}" data-active="${student.active}"
           >${student.active ? 'Archive' : 'Restore'}</button>`}</div>
@@ -1906,10 +2410,15 @@ async function addStudent() {
   msg.textContent = 'Saving…';
   await withBusy(async () => {
     const created = await api.enroll(id, name, grade, email);
-    state.students.push({
+    // team_id starts blank: enrollment does not put anyone on a team, and the
+    // roster picker or the Teams tab is where that happens.
+    const student = {
       student_id: created.student_id, name: created.name,
       grade: created.grade, active: created.active, email: created.email || '',
-    });
+      team_id: '',
+    };
+    state.students.push(student);
+    state.studentById.set(student.student_id, student);
     state.students.sort((a, b) => a.name.localeCompare(b.name));
     state.adding = false;
   });
@@ -1990,6 +2499,160 @@ async function saveEmail(studentId) {
     () => api.admin.setEmail(state.pin, studentId, email),
     (data) => { if (data && data.student) Object.assign(student, data.student); },
     `Could not save the email for ${student.name}`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Team writes
+//
+// All of these are pure roster edits. No event is written, no session moves and
+// no total changes — only what the totals are grouped by — so the optimistic
+// rollbacks here have nothing to put back but a label.
+// ---------------------------------------------------------------------------
+
+function sortTeams(teams) {
+  return teams.slice().sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Move one student, from the roster's inline picker. */
+function saveStudentTeam(studentId, teamId) {
+  const student = state.studentById.get(studentId);
+  state.editingTeam = null;
+  if (!student || (student.team_id || '') === teamId) { render(); return; }
+
+  const previous = student.team_id || '';
+  optimistic(
+    () => {
+      student.team_id = teamId;
+      return () => { student.team_id = previous; };
+    },
+    () => api.admin.setTeam(state.pin, studentId, teamId),
+    (data) => {
+      const record = data && data.students && data.students[0];
+      if (record) Object.assign(student, record);
+    },
+    `Could not move ${student.name} to ${teamName(teamId)}`
+  );
+}
+
+/**
+ * Create a team. NOT optimistic, unlike the rest of this page: the team_id is
+ * minted by the server, and every other control here — the filter, the pickers,
+ * the assign panel — keys off it. Inventing a placeholder id and swapping it
+ * out underneath a coach who has already started ticking names is a worse
+ * second than the one it saves.
+ */
+async function createTeam() {
+  const name = ($('add-team-name')?.value || '').trim();
+  const msg = $('add-team-msg');
+  if (name.length < 2) { if (msg) msg.textContent = 'Enter a team name.'; return; }
+  if (state.teams.some((t) => t.name.toLowerCase() === name.toLowerCase())) {
+    if (msg) msg.textContent = 'There is already a team with that name.';
+    return;
+  }
+  if (msg) msg.textContent = 'Creating…';
+
+  savingCount += 1;
+  renderSaving();
+  try {
+    const data = await api.admin.createTeam(state.pin, name);
+    state.teams = sortTeams(data.teams || []);
+    state.addingTeam = false;
+    // Preselect it in the assigner: creating a team is almost always the first
+    // half of "…and now put these nine people on it".
+    if (data.team) state.assignTeamId = data.team.team_id;
+    render();
+  } catch (err) {
+    const box = $('add-team-msg');
+    const text = err instanceof ApiError ? err.message : String(err);
+    if (box) box.textContent = text; else toast('Could not create the team — ' + text);
+  } finally {
+    savingCount -= 1;
+    renderSaving();
+  }
+}
+
+/** Rename a team. One cell on the server; members carry the id, so nobody moves. */
+function saveTeamRename(teamId) {
+  const team = teamById(teamId);
+  const name = ($('team-name-input')?.value || '').trim();
+  if (!team) { state.renamingTeam = null; render(); return; }
+  if (name.length < 2 || name === team.name) { state.renamingTeam = null; render(); return; }
+  if (state.teams.some((t) => t.team_id !== teamId && t.name.toLowerCase() === name.toLowerCase())) {
+    toast('There is already a team called "' + name + '".');
+    return;
+  }
+
+  state.renamingTeam = null;
+  const previous = team.name;
+  optimistic(
+    () => {
+      team.name = name;
+      state.teams = sortTeams(state.teams);
+      return () => { team.name = previous; state.teams = sortTeams(state.teams); };
+    },
+    () => api.admin.renameTeam(state.pin, teamId, name),
+    (data) => { if (data && data.teams) state.teams = sortTeams(data.teams); },
+    `Could not rename ${previous}`
+  );
+}
+
+/**
+ * Delete a team. Its members become Unassigned — the server clears the column
+ * inside the same lock, and this mirrors that locally so no row is left
+ * pointing at a team that is gone.
+ */
+function deleteTeam(teamId) {
+  const team = teamById(teamId);
+  state.confirmingTeam = null;
+  if (!team) { render(); return; }
+
+  const members = studentsOfTeam(teamId, { includeInactive: true });
+  const previousTeams = state.teams.slice();
+  const wasFiltered = state.teamFilter === teamId;
+
+  optimistic(
+    () => {
+      state.teams = state.teams.filter((t) => t.team_id !== teamId);
+      for (const member of members) member.team_id = '';
+      if (wasFiltered) state.teamFilter = 'all';
+      if (state.assignTeamId === teamId) state.assignTeamId = '';
+      return () => {
+        state.teams = previousTeams;
+        for (const member of members) member.team_id = teamId;
+        if (wasFiltered) state.teamFilter = teamId;
+      };
+    },
+    () => api.admin.deleteTeam(state.pin, teamId),
+    (data) => { if (data && data.teams) state.teams = sortTeams(data.teams); },
+    `Could not delete ${team.name}`
+  );
+}
+
+/** The bulk assigner: everyone ticked moves in one request. */
+function assignSelected() {
+  const ids = [...state.selectedStudents].filter((id) => state.studentById.has(id));
+  if (!ids.length) return;
+  const teamId = state.assignTeamId || '';
+  const previous = new Map(ids.map((id) => [id, state.studentById.get(id).team_id || '']));
+
+  optimistic(
+    () => {
+      for (const id of ids) state.studentById.get(id).team_id = teamId;
+      state.selectedStudents = new Set();
+      return () => {
+        for (const id of ids) state.studentById.get(id).team_id = previous.get(id);
+        state.selectedStudents = new Set(ids);
+      };
+    },
+    () => api.admin.setTeam(state.pin, ids, teamId),
+    (data) => {
+      for (const record of (data && data.students) || []) {
+        const student = state.studentById.get(record.student_id);
+        if (student) Object.assign(student, record);
+      }
+    },
+    `Could not move ${ids.length} student${ids.length === 1 ? '' : 's'} to ${teamName(teamId)}`
   );
 }
 
@@ -2096,14 +2759,16 @@ function csvCell(value) {
 
 function exportCsv() {
   const rows = timesheetRows();
-  const header = ['student_id', 'name', 'grade', 'email', 'active', 'total_hours', 'total_minutes',
+  const header = ['student_id', 'name', 'grade', 'team', 'email', 'active', 'total_hours', 'total_minutes',
                   'sessions', 'avg_session_minutes', 'longest_minutes', 'shortest_minutes',
                   'sessions_per_week', 'last_seen', 'sessions_needing_review'];
 
   const lines = [header.join(',')];
   for (const { student, st } of rows) {
     lines.push([
-      student.student_id, student.name, student.grade, student.email || '', student.active,
+      student.student_id, student.name, student.grade,
+      teamKeyOf(student) === UNASSIGNED ? '' : teamName(teamKeyOf(student)),
+      student.email || '', student.active,
       fmtHours(st.totalMinutes), st.totalMinutes, st.count,
       st.average ?? '', st.longest ?? '', st.shortest ?? '', st.perWeek ?? '',
       st.lastSeen ? new Date(st.lastSeen).toLocaleString() : '', st.problems,
@@ -2111,12 +2776,16 @@ function exportCsv() {
   }
 
   const range = state.from || state.to ? (state.from || 'start') + '_to_' + (state.to || 'today') : 'all-time';
+  // Name the file after what is actually in it: a CSV filtered to one team and
+  // called lab-hours_all-time.csv is the kind of thing that gets emailed to a
+  // sponsor as the whole team's numbers.
+  const scope = state.teamFilter === 'all' ? '' : '_' + teamLabel().toLowerCase().replace(/[^a-z0-9]+/g, '-');
   // ﻿ so Excel opens it as UTF-8 and does not mangle accented names.
   const blob = new Blob(['﻿' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = 'lab-hours_' + range + '.csv';
+  link.download = 'lab-hours_' + range + scope + '.csv';
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -2147,6 +2816,10 @@ $('view').addEventListener('click', (event) => {
                         state.confirming = null; render(); $('email-input')?.select(); break;
     case 'email-save':  saveEmail(id); break;
     case 'email-cancel': state.editingEmail = null; render(); break;
+    case 'edit-team':   state.editingTeam = id; state.renaming = null; state.editingEmail = null;
+                        state.editing = null; state.confirming = null;
+                        render(); $('team-select')?.focus(); break;
+    case 'team-cancel': state.editingTeam = null; render(); break;
     case 'show-add':    state.adding = true; render(); $('add-id')?.focus(); break;
     case 'add-cancel':  state.adding = false; render(); break;
     case 'add-save':    addStudent(); break;
@@ -2158,6 +2831,41 @@ $('view').addEventListener('click', (event) => {
                           : { key: el.dataset.key, dir: el.dataset.key === 'name' ? 1 : -1 };
                         render(); break;
     case 'preset':      applyPreset(preset); render(); break;
+    // --- teams ---
+    case 'team-sort':   state.teamSort = state.teamSort.key === el.dataset.key
+                          ? { key: el.dataset.key, dir: -state.teamSort.dir }
+                          : { key: el.dataset.key, dir: el.dataset.key === 'name' ? 1 : -1 };
+                        render(); break;
+    case 'team-view':   state.teamFilter = id; goto('timesheet'); break;
+    case 'show-add-team': state.addingTeam = true; render(); $('add-team-name')?.focus(); break;
+    case 'add-team-cancel': state.addingTeam = false; render(); break;
+    case 'add-team-save': createTeam(); break;
+    case 'team-rename': state.renamingTeam = id; state.confirmingTeam = null;
+                        render(); $('team-name-input')?.select(); break;
+    case 'team-rename-save': saveTeamRename(id); break;
+    case 'team-rename-cancel': state.renamingTeam = null; render(); break;
+    case 'team-delete': state.confirmingTeam = id; state.renamingTeam = null; render(); break;
+    case 'team-delete-cancel': state.confirmingTeam = null; render(); break;
+    case 'team-delete-confirm': deleteTeam(id); break;
+    // Checkboxes here rather than in the input listener, so a click on the
+    // label and a click on the box take the same path.
+    case 'pick-student':
+      if (state.selectedStudents.has(id)) state.selectedStudents.delete(id);
+      else state.selectedStudents.add(id);
+      render(); break;
+    case 'pick-all': {
+      const term = state.assignSearch.trim().toLowerCase();
+      const shown = state.students.filter((x) =>
+        (state.showInactive || x.active) &&
+        (!term || x.name.toLowerCase().includes(term) || x.student_id.includes(term)));
+      const allTicked = shown.length && shown.every((x) => state.selectedStudents.has(x.student_id));
+      for (const student of shown) {
+        if (allTicked) state.selectedStudents.delete(student.student_id);
+        else state.selectedStudents.add(student.student_id);
+      }
+      render(); break;
+    }
+    case 'assign-save': assignSelected(); break;
     case 'flag-filter': state.flagFilter = el.dataset.filter; render(); break;
     case 'export':      exportCsv(); break;
     case 'edit':        state.editing = state.editing === key ? null : key;
@@ -2207,6 +2915,14 @@ $('view').addEventListener('keydown', (event) => {
   } else if (event.target.id === 'email-input') {
     if (event.key === 'Enter') { event.preventDefault(); saveEmail(state.editingEmail); }
     else if (event.key === 'Escape') { state.editingEmail = null; render(); }
+  } else if (event.target.id === 'team-name-input') {
+    if (event.key === 'Enter') { event.preventDefault(); saveTeamRename(state.renamingTeam); }
+    else if (event.key === 'Escape') { state.renamingTeam = null; render(); }
+  } else if (event.target.id === 'add-team-name') {
+    if (event.key === 'Enter') { event.preventDefault(); createTeam(); }
+    else if (event.key === 'Escape') { state.addingTeam = false; render(); }
+  } else if (event.target.id === 'team-select') {
+    if (event.key === 'Escape') { state.editingTeam = null; render(); }
   }
 });
 
@@ -2216,6 +2932,11 @@ $('view').addEventListener('input', (event) => {
   else if (el.id === 'from') { state.from = el.value; render(); }
   else if (el.id === 'to') { state.to = el.value; render(); }
   else if (el.id === 'show-inactive') { state.showInactive = el.checked; render(); }
+  else if (el.id === 'team-filter') { state.teamFilter = el.value; render(); }
+  // One field, nothing to validate: the picker saves the moment it changes.
+  else if (el.id === 'team-select') { saveStudentTeam(el.dataset.id, el.value); }
+  else if (el.id === 'assign-team') { state.assignTeamId = el.value; render(); }
+  else if (el.id === 'assign-search') { state.assignSearch = el.value; render(); }
 });
 
 /** Leaving a view abandons whatever inline editor was open in it. */
@@ -2224,12 +2945,17 @@ function goto(view) {
   state.detailId = null;
   state.renaming = null;
   state.editingEmail = null;
+  state.editingTeam = null;
+  state.renamingTeam = null;
+  state.addingTeam = false;
+  state.confirmingTeam = null;
   state.editing = null;
   state.confirming = null;
   render();
 }
 
 $('tab-roster').addEventListener('click', () => goto('roster'));
+$('tab-teams').addEventListener('click', () => goto('teams'));
 $('tab-timesheet').addEventListener('click', () => goto('timesheet'));
 $('tab-flagged').addEventListener('click', () => goto('flagged'));
 $('tab-rejected').addEventListener('click', () => goto('rejected'));

@@ -57,16 +57,18 @@ var TAB_STUDENTS  = 'Students';
 var TAB_EVENTS    = 'Events';
 var TAB_SUMMARIES = 'Summaries';
 var TAB_CONFIG    = 'Config';
+var TAB_TEAMS     = 'Teams';
 
 /**
  * Column order is the contract. Rows are read by index, so never reorder these
  * or insert a column in the middle — append at the end if you must extend.
  */
 var HEADERS = {};
-HEADERS[TAB_STUDENTS]  = ['student_id', 'name', 'grade', 'active', 'created_at', 'email', 'summary_token'];
+HEADERS[TAB_STUDENTS]  = ['student_id', 'name', 'grade', 'active', 'created_at', 'email', 'summary_token', 'team_id'];
 HEADERS[TAB_EVENTS]    = ['event_id', 'student_id', 'timestamp', 'direction', 'source', 'flagged', 'note', 'status'];
 HEADERS[TAB_SUMMARIES] = ['summary_id', 'student_id', 'session_date', 'text', 'photo_urls', 'submitted_at'];
 HEADERS[TAB_CONFIG]    = ['key', 'value'];
+HEADERS[TAB_TEAMS]     = ['team_id', 'name', 'created_at'];
 
 var DRIVE_FOLDER_NAME = 'Robotics Lab Summaries';
 
@@ -101,9 +103,12 @@ var STATUS_RECOVERED = 'recovered';
 
 // Column index (1-based) of Events.status. Column order is the contract.
 var COL_EVENT_STATUS = 8;
-// Column indexes of the two Students columns written in place after enrollment.
+// Column indexes of the Students columns written in place after enrollment.
 var COL_STUDENT_EMAIL = 6;
 var COL_STUDENT_TOKEN = 7;
+var COL_STUDENT_TEAM  = 8;
+// Column index of Teams.name, the only cell a rename touches.
+var COL_TEAM_NAME     = 2;
 
 // Outbound summary emails wait here between the scan that created them and the
 // flushSummaryEmails trigger that sends them. See "Summary emails" below.
@@ -180,7 +185,7 @@ function doGet(e) {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var tabs = {};
     var missing = [];
-    var names = [TAB_STUDENTS, TAB_EVENTS, TAB_SUMMARIES, TAB_CONFIG];
+    var names = [TAB_STUDENTS, TAB_EVENTS, TAB_SUMMARIES, TAB_CONFIG, TAB_TEAMS];
     for (var i = 0; i < names.length; i++) {
       var sh = ss.getSheetByName(names[i]);
       if (!sh) { missing.push(names[i]); tabs[names[i]] = null; continue; }
@@ -244,6 +249,11 @@ function doPost(e) {
       case 'setEmail':      return json_(actionSetEmail_(payload));
       case 'addManualSession': return json_(actionAddManualSession_(payload));
       case 'recoverEvents': return json_(actionRecoverEvents_(payload));
+      case 'getTeams':      return json_(actionGetTeams_(payload));
+      case 'createTeam':    return json_(actionCreateTeam_(payload));
+      case 'renameTeam':    return json_(actionRenameTeam_(payload));
+      case 'deleteTeam':    return json_(actionDeleteTeam_(payload));
+      case 'setTeam':       return json_(actionSetTeam_(payload));
 
       default: fail_('unknown action: ' + action);
     }
@@ -333,10 +343,16 @@ function loadTable_(name) {
 
   // Column order is the contract; refuse to guess if someone reordered them.
   for (var c = 0; c < header.length; c++) {
-    if (String(values[0][c]).trim().toLowerCase() !== header[c]) {
-      fail_('tab "' + name + '" column ' + (c + 1) + ' should be "' + header[c] +
-            '" but is "' + values[0][c] + '" — column order is the contract');
+    var cell = String(values[0][c] === undefined ? '' : values[0][c]).trim().toLowerCase();
+    if (cell === header[c]) continue;
+    // A blank cell is the ordinary case of a tab that predates a column added
+    // later. That is a migration, not a corruption, and it has a one-line fix.
+    if (cell === '') {
+      fail_('tab "' + name + '" is missing the "' + header[c] + '" column — ' +
+            'run initializeSheets() once from the Apps Script editor');
     }
+    fail_('tab "' + name + '" column ' + (c + 1) + ' should be "' + header[c] +
+          '" but is "' + values[0][c] + '" — column order is the contract');
   }
 
   var out = [];
@@ -957,6 +973,7 @@ function studentIndex_(rows) {
                                                      : String(rows[i].created_at || ''),
       email: String(rows[i].email || '').trim(),
       summary_token: String(rows[i].summary_token || '').trim(),
+      team_id: String(rows[i].team_id || '').trim(),
       _row: rows[i]._row
     };
   }
@@ -970,7 +987,8 @@ function studentIndex_(rows) {
  */
 function publicStudent_(s) {
   return { student_id: s.student_id, name: s.name, grade: s.grade,
-           active: s.active, created_at: s.created_at, email: s.email || '' };
+           active: s.active, created_at: s.created_at, email: s.email || '',
+           team_id: s.team_id || '' };
 }
 
 /**
@@ -993,6 +1011,263 @@ function normEmail_(v) {
 /** A fresh URL-safe summary token: 32 hex characters from a v4 UUID. */
 function newToken_() {
   return Utilities.getUuid().replace(/-/g, '');
+}
+
+// ---------------------------------------------------------------------------
+// Teams
+//
+// A team is a coach-side grouping — Build, Programming, Business, whatever the
+// season calls them — and nothing else in the app knows it exists. It is NOT
+// attendance data: no event, hour, session or statistic changes when a student
+// moves between teams, because Events keys off student_id alone and every total
+// is recomputed from the log. Reassigning the whole roster the night before
+// competition is free.
+//
+// Two decisions worth stating, because both are easy to get wrong later:
+//
+//   1. Students carry a team_id, not a team name. A team can therefore be
+//      renamed by writing one cell, instead of rewriting every member's row and
+//      hoping nothing crashed halfway through.
+//   2. "Unassigned" is not a team. It is the absence of one — a blank team_id,
+//      which is what every existing row already holds after the migration, and
+//      what a student falls back to when their team is deleted. There is no
+//      row for it and it can never be renamed or removed.
+//
+// The tablet never sees any of this. A student in a queue is not asked which
+// subteam they are on.
+// ---------------------------------------------------------------------------
+
+/** Read the Teams tab, tolerating a deployment that has not been migrated. */
+function readTeams_() {
+  if (!ss_().getSheetByName(TAB_TEAMS)) return [];
+  return readTable_(TAB_TEAMS);
+}
+
+function teamIndex_(rows) {
+  var by = {};
+  for (var i = 0; i < rows.length; i++) {
+    var id = String(rows[i].team_id || '').trim();
+    if (!id) continue;
+    by[id] = {
+      team_id: id,
+      name: String(rows[i].name || '').trim(),
+      created_at: rows[i].created_at instanceof Date ? toIso_(rows[i].created_at)
+                                                     : String(rows[i].created_at || ''),
+      _row: rows[i]._row
+    };
+  }
+  return by;
+}
+
+/** The team list as the admin page sees it, alphabetical. */
+function publicTeams_() {
+  var index = teamIndex_(readTeams_());
+  var out = [];
+  for (var id in index) {
+    if (!index.hasOwnProperty(id)) continue;
+    out.push({ team_id: index[id].team_id, name: index[id].name,
+               created_at: index[id].created_at });
+  }
+  out.sort(function (a, b) { return a.name.localeCompare(b.name); });
+  return out;
+}
+
+function normTeamName_(v) {
+  var name = String(v === null || v === undefined ? '' : v).trim().replace(/\s+/g, ' ');
+  if (!name) fail_('a team needs a name');
+  if (name.length > 60) fail_('that team name is too long (max 60 characters)');
+  return name;
+}
+
+/**
+ * Refuse a second team with the same name. Case- and space-insensitive: two
+ * teams a coach cannot tell apart in a dropdown are a bug, not a feature.
+ */
+function assertTeamNameFree_(index, name, exceptId) {
+  var wanted = name.toLowerCase();
+  for (var id in index) {
+    if (!index.hasOwnProperty(id)) continue;
+    if (id === exceptId) continue;
+    if (index[id].name.toLowerCase() === wanted) fail_('there is already a team called "' + index[id].name + '"');
+  }
+}
+
+function newTeamId_() {
+  return 'tm_' + Utilities.getUuid().replace(/-/g, '').slice(0, 12);
+}
+
+/**
+ * Write the team_id column for a set of students in ONE setValues() call.
+ *
+ * `assignments` maps student_id to the team_id it should end up with. Reading
+ * and rewriting the whole column costs two round trips no matter how many
+ * students moved, where a loop of setValue() costs two per student — and this
+ * is the path a "move nine people onto Build" click takes.
+ *
+ * Caller must hold the lock. Returns the number of cells that actually changed.
+ */
+function writeStudentTeams_(students, assignments) {
+  var sh = sheet_(TAB_STUDENTS);
+  var lastRow = sh.getLastRow();
+  if (lastRow < 2) return 0;
+
+  var range = sh.getRange(2, COL_STUDENT_TEAM, lastRow - 1, 1);
+  var column = range.getValues();
+  var changed = 0;
+  for (var sid in assignments) {
+    if (!assignments.hasOwnProperty(sid)) continue;
+    var student = students[sid];
+    if (!student) continue;
+    var index = student._row - 2;          // the column starts at sheet row 2
+    if (index < 0 || index >= column.length) continue;
+    var wanted = assignments[sid];
+    if (String(column[index][0] || '').trim() === wanted) continue;
+    column[index][0] = wanted;
+    student.team_id = wanted;
+    changed++;
+  }
+  if (changed) {
+    range.setValues(column);
+    invalidateTable_(TAB_STUDENTS);        // in place, so not via appendRows_
+  }
+  return changed;
+}
+
+// ---------------------------------------------------------------------------
+// Actions: teams
+// ---------------------------------------------------------------------------
+
+/** The team list, with how many students are on each. */
+function actionGetTeams_(p) {
+  requirePin_(p);
+  var teams = publicTeams_();
+  var students = studentIndex_(readTable_(TAB_STUDENTS));
+
+  var counts = {};
+  var unassigned = 0;
+  for (var sid in students) {
+    if (!students.hasOwnProperty(sid)) continue;
+    var tid = students[sid].team_id;
+    if (tid) counts[tid] = (counts[tid] || 0) + 1;
+    else unassigned++;
+  }
+  for (var i = 0; i < teams.length; i++) {
+    teams[i].member_count = counts[teams[i].team_id] || 0;
+  }
+  return ok_({ teams: teams, unassigned_count: unassigned, generated_at: nowIso_() });
+}
+
+function actionCreateTeam_(p) {
+  requirePin_(p);
+  var name = normTeamName_(p.name);
+
+  return withLock_(function () {
+    var index = teamIndex_(readTeams_());
+    assertTeamNameFree_(index, name, null);
+    var team = { team_id: newTeamId_(), name: name, created_at: nowIso_() };
+    appendRows_(TAB_TEAMS, [[team.team_id, team.name, team.created_at]]);
+    return ok_({ team: team, teams: publicTeams_() });
+  });
+}
+
+/**
+ * Rename a team. One cell. Members carry the id, not the name, so nobody moves
+ * and no total changes.
+ */
+function actionRenameTeam_(p) {
+  requirePin_(p);
+  var teamId = String(p.team_id || '').trim();
+  if (!teamId) fail_('renameTeam needs a team_id');
+  var name = normTeamName_(p.name);
+
+  return withLock_(function () {
+    var index = teamIndex_(readTeams_());
+    var team = index[teamId];
+    if (!team) fail_('no team with id ' + teamId);
+    assertTeamNameFree_(index, name, teamId);
+
+    var previous = team.name;
+    if (name !== previous) {
+      sheet_(TAB_TEAMS).getRange(team._row, COL_TEAM_NAME).setValue(name);
+      invalidateTable_(TAB_TEAMS);         // in place, so not via appendRows_
+      team.name = name;
+    }
+    return ok_({ team: { team_id: teamId, name: name, created_at: team.created_at },
+                 previous_name: previous, changed: name !== previous,
+                 teams: publicTeams_() });
+  });
+}
+
+/**
+ * Delete a team and return its members to Unassigned.
+ *
+ * This is the one place in the whole backend that deletes a row, and it is safe
+ * to: a team holds no history. Nothing references it but the team_id column on
+ * the roster, which is cleared here in the same lock, so there is no window
+ * where a student points at a team that is gone.
+ */
+function actionDeleteTeam_(p) {
+  requirePin_(p);
+  var teamId = String(p.team_id || '').trim();
+  if (!teamId) fail_('deleteTeam needs a team_id');
+
+  return withLock_(function () {
+    var index = teamIndex_(readTeams_());
+    var team = index[teamId];
+    if (!team) fail_('no team with id ' + teamId);
+
+    var students = studentIndex_(readTable_(TAB_STUDENTS));
+    var assignments = {};
+    for (var sid in students) {
+      if (!students.hasOwnProperty(sid)) continue;
+      if (students[sid].team_id === teamId) assignments[sid] = '';
+    }
+    var unassigned = writeStudentTeams_(students, assignments);
+
+    sheet_(TAB_TEAMS).deleteRow(team._row);
+    invalidateTable_(TAB_TEAMS);
+
+    return ok_({ team_id: teamId, name: team.name, unassigned: unassigned,
+                 teams: publicTeams_() });
+  });
+}
+
+/**
+ * Put students on a team, or take them off it.
+ *
+ * Takes `student_id` or a `student_ids` array — a coach assigning a subteam
+ * ticks eight names and saves once, and that must be one request and one column
+ * write, not eight of each. An empty team_id means Unassigned, which is a
+ * normal answer and not an error.
+ */
+function actionSetTeam_(p) {
+  requirePin_(p);
+  var raw = p.student_ids || p.studentIds ||
+            (p.student_id === undefined ? null : [p.student_id]);
+  if (!(raw instanceof Array) || !raw.length) fail_('setTeam needs student_id or a non-empty student_ids array');
+  if (raw.length > 500) fail_('too many students in one request (max 500)');
+
+  var ids = [];
+  for (var i = 0; i < raw.length; i++) ids.push(requireId_(raw[i]));
+  var teamId = String(p.team_id || '').trim();
+
+  return withLock_(function () {
+    if (teamId) {
+      var teams = teamIndex_(readTeams_());
+      if (!teams[teamId]) fail_('no team with id ' + teamId);
+    }
+    var students = studentIndex_(readTable_(TAB_STUDENTS));
+    var assignments = {};
+    for (var j = 0; j < ids.length; j++) {
+      if (!students[ids[j]]) fail_('no student with id ' + ids[j]);
+      assignments[ids[j]] = teamId;
+    }
+    var changed = writeStudentTeams_(students, assignments);
+
+    var updated = [];
+    for (var k = 0; k < ids.length; k++) updated.push(publicStudent_(students[ids[k]]));
+    return ok_({ team_id: teamId, changed: changed, students: updated });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,7 +1391,9 @@ function actionEnroll_(p) {
     // who adds an email in March should not need a second migration pass to get
     // a working link, and a coach can hand out the link by any other route.
     var token = newToken_();
-    appendRows_(TAB_STUDENTS, [[studentId, name, grade, true, created, email, token]]);
+    // team_id is blank at enrollment: teams are an admin-side grouping, and the
+    // tablet must never ask a student in a queue which subteam they are on.
+    appendRows_(TAB_STUDENTS, [[studentId, name, grade, true, created, email, token, '']]);
     return ok_({
       student_id: studentId, name: name, grade: grade, active: true,
       created_at: created, email: email
@@ -1640,7 +1917,7 @@ function actionGetRoster_(p) {
     // fetch one short string per student would be silly.
     var entry = slim
       ? { student_id: s.student_id, name: s.name, grade: s.grade,
-          active: s.active, email: s.email }
+          active: s.active, email: s.email, team_id: s.team_id || '' }
       : publicStudent_(s);
     if (!slim) {
       var events = byStudent[sid] || [];
@@ -1656,6 +1933,11 @@ function actionGetRoster_(p) {
     students: roster,
     count: roster.length,
     currently_in_lab: slim ? null : inLab,
+    // Teams ride along on the roster rather than living behind their own
+    // fetch: the admin page cannot draw a single row without both, the list is
+    // a handful of short strings, and a second round trip to Apps Script for it
+    // would cost more than the whole payload.
+    teams: publicTeams_(),
     generated_at: nowIso_()
   });
 }
@@ -2334,7 +2616,7 @@ function initializeSheets() {
     var report = { created_tabs: [], repaired_headers: [], columns_added: [],
                    config_added: [], tokens_backfilled: 0, notes: [] };
 
-    var tabs = [TAB_STUDENTS, TAB_EVENTS, TAB_SUMMARIES, TAB_CONFIG];
+    var tabs = [TAB_STUDENTS, TAB_EVENTS, TAB_SUMMARIES, TAB_CONFIG, TAB_TEAMS];
     for (var i = 0; i < tabs.length; i++) {
       var name = tabs[i];
       var header = HEADERS[name];
@@ -2393,7 +2675,8 @@ function initializeSheets() {
     // 7-digit IDs must not become numbers (leading zeros) and ISO timestamps
     // must not become spreadsheet dates.
     sheet_(TAB_STUDENTS).getRange('A:A').setNumberFormat('@');
-    sheet_(TAB_STUDENTS).getRange('E:G').setNumberFormat('@');   // created_at, email, summary_token
+    sheet_(TAB_STUDENTS).getRange('E:H').setNumberFormat('@');   // created_at, email, summary_token, team_id
+    sheet_(TAB_TEAMS).getRange('A:C').setNumberFormat('@');      // team_id, name, created_at
     sheet_(TAB_EVENTS).getRange('B:C').setNumberFormat('@');
     sheet_(TAB_EVENTS).getRange('H:H').setNumberFormat('@');     // status
     sheet_(TAB_SUMMARIES).getRange('B:C').setNumberFormat('@');
@@ -3208,7 +3491,7 @@ function diagnoseSummaryEmail(studentId) {
  * hours. Run it after editing a tab directly.
  */
 function refreshCaches() {
-  var tabs = [TAB_STUDENTS, TAB_EVENTS, TAB_SUMMARIES, TAB_CONFIG];
+  var tabs = [TAB_STUDENTS, TAB_EVENTS, TAB_SUMMARIES, TAB_CONFIG, TAB_TEAMS];
   for (var i = 0; i < tabs.length; i++) invalidateTable_(tabs[i]);
   CONFIG_CACHE = null;
   TABLE_MEMO_ = {};

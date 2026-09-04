@@ -16,7 +16,7 @@ recovers it.
 | Frontend | Plain static HTML/CSS/JS. No build step, no npm, no framework, no bundler. Vanilla ES modules only. |
 | Hosting | GitHub Pages, serving the repo as-is. |
 | Backend | One Google Apps Script Web App, acting as a JSON API. |
-| Database | A Google Sheet (4 tabs). |
+| Database | A Google Sheet (5 tabs). |
 | Photo storage | A Google Drive folder, written to by Apps Script. |
 
 Everything must stay on free tiers with no credit card. That rules out Firebase Storage
@@ -145,7 +145,7 @@ offline fallback); static assets are stale-while-revalidate. Bump `VERSION` in
 
 ## Sheet schema
 
-Four tabs. Column order is the contract — Apps Script reads by index, so do not reorder
+Five tabs. Column order is the contract — Apps Script reads by index, so do not reorder
 or insert columns in the middle.
 
 **`Students`**
@@ -159,6 +159,7 @@ or insert columns in the middle.
 | `created_at` | Server-assigned. |
 | `email` | Optional. The tablet's enrollment sheet has a Skip button and an empty value is a normal answer, not an error. Editable from the admin roster. |
 | `summary_token` | 32 random URL-safe chars, minted at enrollment for **every** student, email or not. Backfilled by `initializeSheets()`. Never returned by a public endpoint. |
+| `team_id` | Optional. Blank means Unassigned, which is the normal starting state — see Teams. Written only by the admin page. |
 
 **`Events`** — append-only
 
@@ -184,6 +185,14 @@ or insert columns in the middle.
 | `photo_urls` | Drive URLs, written by Apps Script after upload. |
 | `submitted_at` | Server-assigned. |
 
+**`Teams`**
+
+| Column | Notes |
+| --- | --- |
+| `team_id` | `tm_` + 12 hex. Minted server-side; this is what `Students.team_id` points at. |
+| `name` | Unique, case-insensitively. Renaming writes this one cell — see Teams. |
+| `created_at` | Server-assigned. |
+
 **`Config`** — `key`, `value`. Runtime settings that must not require a redeploy.
 
 | Key | Notes |
@@ -197,6 +206,32 @@ or insert columns in the middle.
 | `grace_period_hours` | Default `24`. How long after scanning out a student has to submit a summary. Read by `rejectUnloggedSessions()` and quoted in the email, so the two always agree. Values ≤ 0 fall back to the default. |
 | `summary_email_immediate` | Default `true`. Set `false` to drop the one-shot trigger and let the recurring flusher do all delivery. |
 | `summary_base_url` | Public URL of `summary.html`. **Ships empty** — until it is set, no scan-out emails are sent and `flushSummaryEmails` says so in the log. |
+
+## Teams
+
+Subteams — Build, Programming, Business — exist purely so a coach can group and
+filter the roster. They are **roster data, not attendance data**, and three rules keep
+that true:
+
+- **Nothing is derived from a team.** `Events` stores only `student_id`, and every hour,
+  session, average and chart bucket is recomputed from the log, so moving a student
+  between teams changes what the totals are *grouped by* and never what they are. There
+  is no migration, no recount and no history to keep.
+- **Students carry `team_id`, not a team name.** A rename is one cell in `Teams`, not a
+  rewrite of every member's row that could die halfway through.
+- **Unassigned is not a team.** It is the absence of one — an empty `team_id` — which is
+  what every row holds after the migration and what a student falls back to when their
+  team is deleted. It has no row, cannot be renamed and cannot be removed. In the admin
+  page it is the empty string, and it sorts last in every team view.
+
+`deleteTeam` is the only place in the backend that deletes a row, and it is safe to
+because a team holds no history: it clears `Students.team_id` for the members inside the
+same lock, so there is no window where a row points at a team that is gone.
+
+Teams are **admin-only**. The tablet never sees them — a student in a queue is not asked
+which subteam they are on — so `enroll` writes a blank `team_id` and `scan` never reads
+one. The team list rides along on `getRoster` rather than behind its own fetch, because
+the admin page cannot draw a single row without both.
 
 ## Sessions that were never scanned
 
@@ -235,7 +270,7 @@ date to `recovered` on the spot, without an admin.
 
 ```
 index.html              scanner (tablet) — registers the service worker
-admin.html              roster, timesheet, needs-review + rejected-hours queues,
+admin.html              roster, teams, timesheet, needs-review + rejected-hours queues,
                         manual session entry, student detail
 summary.html            student summary submission (phone); ?t=<token> skips ID entry
 css/styles.css          shared styles
