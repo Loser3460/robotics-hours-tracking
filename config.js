@@ -16,4 +16,4 @@
 //   Execute as: Me   |   Who has access: Anyone
 // A redeploy that creates a NEW deployment changes this URL; paste the new one here.
 
-export const API_URL = 'https://script.google.com/macros/s/AKfycbzR6CSNu3tiInHXqNB21U8mlJUigqt8ktaziIMMcA6GHn22kDuLuZTQQTBwD_sNXDA/exec';
+export const API_URL = 'https://script.google.com/macros/s/AKfycby2CheYCuJP_XqDDeeD394K9CsuALmitCck5-mwmdE4NxLtbCW-gKNWUSnuPffa8lg/exec';
